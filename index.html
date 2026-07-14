@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Arsmi Games — Web SDK reference</title>
+
+    <!--
+      The platform SDK. Two sources, in this order, and the order is the whole trick:
+
+        1. /sdk/gamehub-sdk.js — the platform's own copy, always current. The path is
+           ABSOLUTE, so it only resolves when the platform is the one serving this game
+           (arsmigames.com/games/<slug>/…).
+
+        2. gamehub-sdk.js — the copy sitting next to this file. Needed because a build
+           hosted ANYWHERE else — a static host, Cloudflare Pages, file:// — would resolve
+           that absolute path against THAT host and get a 404.
+
+      document.write is deliberate: it is synchronous, so the SDK is defined before any of
+      our modules run. "Eventually loaded" is not good enough — the game asks the bridge a
+      question on its first frame.
+    -->
+    <script src="/sdk/gamehub-sdk.js"></script>
+    <script>
+      if (!window.GameHubSDK) {
+        document.write('<script src="gamehub-sdk.js"><\/script>');
+      }
+    </script>
+
+    <link rel="stylesheet" href="src/styles.css" />
+  </head>
+
+  <body>
+    <header>
+      <div>
+        <h1>Kids Quiz</h1>
+        <p class="sub">Web SDK reference · every platform call, in a real game</p>
+      </div>
+      <div class="chips">
+        <span id="chipBridge" class="chip">No bridge</span>
+        <span id="chipUser" class="chip">Guest</span>
+        <span id="chipWallet" class="chip">— flux</span>
+        <span id="chipMute" class="chip">Audio on</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- the game -->
+      <section class="panel">
+        <div class="section-title">Save mode</div>
+        <div class="row modes">
+          <button id="modeLocal" class="mode">Local only</button>
+          <button id="modePlatform" class="mode active">Platform</button>
+          <button id="modeBackend" class="mode">Own backend</button>
+        </div>
+        <p id="modeNote" class="note"></p>
+
+        <div class="stats">
+          <div><span id="progress">Question 1 of 8</span></div>
+          <div class="stat">Score <b id="score">0</b></div>
+          <div class="stat">Best <b id="best">0</b></div>
+          <div class="stat dim" id="saveMeta">not synced</div>
+        </div>
+
+        <h2 id="question">…</h2>
+        <div id="answers" class="answers"></div>
+        <p id="feedback" class="feedback"></p>
+
+        <div class="row">
+          <button id="hint" class="gold">Watch an ad for a hint</button>
+          <button id="buyHint" class="gold ghost">Buy a hint · 5 flux</button>
+        </div>
+        <div class="row">
+          <button id="reset" class="danger">Clear save</button>
+        </div>
+      </section>
+
+      <!-- the console -->
+      <section class="panel">
+        <div class="section-title">SDK console</div>
+
+        <div class="grid">
+          <button id="btnWhoAmI">Who am I?</button>
+          <button id="btnLogin">Request login</button>
+          <button id="btnFullscreen">Fullscreen</button>
+          <button id="btnMute">Toggle mute</button>
+          <button id="btnAd" class="gold">Show rewarded ad</button>
+          <button id="btnWallet">Read wallet</button>
+          <button id="btnAchv">Define achievements</button>
+          <button id="btnProgress">+1 progress</button>
+          <button id="btnBoard">Define leaderboard</button>
+          <button id="btnScore">Submit 100</button>
+          <button id="btnDump">Dump save</button>
+          <button id="btnPlatformLog">Send a log line</button>
+        </div>
+
+        <div class="log-head">
+          <span class="section-title">Bridge log</span>
+          <button id="clearLog" class="small">Clear</button>
+        </div>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+
+    <script type="module" src="src/main.js"></script>
+  </body>
+</html>

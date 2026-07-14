@@ -1,0 +1,157 @@
+/* Deliberately plain. This project is a reference for the SDK, not for CSS — the code you
+   are meant to read is in platform.js. */
+
+:root {
+  --bg: #100f13;
+  --panel: #17161c;
+  --soft: #201f27;
+  --line: #2a2932;
+  --text: #e8e6ef;
+  --muted: #8b8899;
+  --faint: #56545f;
+  --accent: #cc785c;
+  --good: #5cc47d;
+  --bad: #e65b5b;
+  --gold: #e8b339;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(204, 120, 92, 0.10), transparent);
+}
+
+h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+.sub { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.chip {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 700;
+}
+.chip.ok { border-color: rgba(92, 196, 125, 0.3); background: rgba(92, 196, 125, 0.12); color: var(--good); }
+
+main {
+  display: grid;
+  gap: 16px;
+  padding: 16px 24px 32px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 900px) { main { grid-template-columns: 1fr 1fr; } }
+
+.panel {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+}
+
+.section-title {
+  margin-bottom: 10px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.row { display: flex; gap: 8px; margin-top: 10px; }
+.row > * { flex: 1; }
+
+.note { margin: 8px 0 0; color: var(--muted); font-size: 12px; min-height: 32px; }
+
+button {
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #282730; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.mode.active { border-color: rgba(204, 120, 92, 0.5); background: rgba(204, 120, 92, 0.14); color: var(--accent); }
+.gold { border-color: rgba(232, 179, 57, 0.35); background: rgba(232, 179, 57, 0.14); color: var(--gold); }
+.gold.ghost { background: transparent; }
+.danger { border-color: rgba(230, 91, 91, 0.3); background: rgba(230, 91, 91, 0.1); color: var(--bad); }
+.small { flex: 0; padding: 5px 10px; font-size: 11px; }
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: baseline;
+  margin: 18px 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.stat b { color: var(--text); font-size: 14px; }
+.dim { margin-left: auto; color: var(--faint); font-family: ui-monospace, monospace; }
+
+h2 { margin: 6px 0 14px; font-size: 20px; font-weight: 700; }
+
+.answers { display: grid; gap: 8px; }
+.answer { text-align: left; padding: 13px 14px; font-size: 15px; }
+.answer.dimmed { opacity: 0.3; }
+
+.feedback { min-height: 22px; margin: 12px 0 0; font-size: 13px; font-weight: 600; color: var(--muted); }
+.feedback.good { color: var(--good); }
+.feedback.bad { color: var(--bad); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 20px 0 8px;
+}
+.log-head .section-title { margin: 0; }
+
+/* Fixed height on purpose: with only a min-height the box grows with its content and the
+   PAGE scrolls instead, which makes it useless while a game is chattering at you. */
+.log {
+  height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0c0b0f;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.log-line { display: flex; gap: 8px; }
+.log-time { flex: none; color: var(--faint); }
+.log-text { min-width: 0; word-break: break-word; color: var(--muted); }
+.log-line.out .log-text { color: #9ec5fe; }
+.log-line.in  .log-text { color: var(--good); }
+.log-line.err .log-text { color: var(--bad); }
+.log-line.warn .log-text { color: var(--gold); }
