@@ -73,7 +73,7 @@ await Platform.connect();     // resolves when the platform hands over the playe
 `init()` resolves immediately with `{}` when there is no platform, so a standalone build does
 not hang — which is exactly what would happen if you awaited a message that never arrives.
 
-Declare your achievements and leaderboard **after** the handshake. Before it, you are
+Declare your leaderboard **after** the handshake. Before it, you are
 shouting into a void: there is nobody on the other end of the bridge yet.
 
 ## Save data — the three modes
@@ -150,12 +150,16 @@ else showMessage(result.error);          // "Not enough Flux Coins."
 **Do not hand over what the player is buying until `spend()` resolves `ok`.** The server can
 refuse — a game that grants first and reconciles later is a game that gives things away.
 
-Coins are **earned** through rewarded ads and achievement claims, both of which the platform
-grants after it has *seen* the thing happen. There is no "give the player coins" call, and
-there will not be one.
+**There is no "give the player coins" call, and there will not be one.** `wallet.set()` has
+been removed — it wrote an absolute balance and was trusted as-is, so any game could mint
+unlimited currency with one line. The SDK now refuses to send the message at all:
+`sdk.emit("gamehub:wallet:set", …)` is rejected before it leaves your iframe.
 
-`wallet.set()` still exists and is **deprecated**: it writes an absolute balance and is
-trusted as-is, so a game can mint currency with it.
+Flux Coins go up in three places, none of them a game: the player **buys** them, the player
+watches **the platform's own ad** from the platform's UI.
+
+If your game has its own currency — coins, gems, lives — that is yours to grant however you
+like. It does not convert to Flux.
 
 **Never put currency in a save.** Save data lives on the player's machine and is trusted as
 written — they can edit it.
@@ -163,8 +167,11 @@ written — they can edit it.
 ## Rewarded ads
 
 The ad is a **platform overlay**, drawn over your game. Your game does not render it, does
-not time it, and does not decide whether it was watched — the reward is real currency, so
-that call stays outside the iframe.
+not time it, and does not decide whether it was watched — a game cannot be trusted to report
+that, so the decision stays outside the iframe.
+
+**An ad your game asks for pays no Flux Coins.** It pays whatever *your* game promised — the
+hint below, an extra life, a skin — and *your* code grants it when `rewarded` is true.
 
 ```js
 paused = true;
@@ -182,32 +189,14 @@ if (rewarded) giveHint();                // ONLY here
 
 ## Achievements
 
-```js
-sdk.achievements.define({
-  achievements: [{
-    key: "quiz_first_correct",
-    title: "Bright spark",
-    metric: "quiz_correct",
-    target: 1,
-    rewardFlux: 10,             // must be > 0
-    type: "daily",
-    shareWithPlatform: true,    // must be true
-  }],
-});
+**The platform does not have achievements.** The feature was removed: there is no
+`sdk.achievements` object, no manifest to send, and no progress to report. The SDK refuses
+`gamehub:achievements:manifest` and `gamehub:achievement:progress` outright — they never leave
+your iframe, and you get an error in your console naming the event.
 
-Platform.achievementProgress("quiz_correct", 1);
-```
-
-**Every field is load-bearing.** The platform's importer **skips** any entry missing one —
-silently, with no error and no log line. An achievement without `rewardFlux`, or without
-`shareWithPlatform: true`, simply never comes into existence, and your game has no way to
-find out. Those two are the ones everybody forgets.
-
-The `metric` you pass to `progress()` must match a manifest entry's `metric` **exactly**, or
-it counts towards nothing.
-
-Check your manifest in **SDK Assessment** (admin/dashboard): it validates against the real
-importer's rules and lists exactly what would be thrown away.
+Track achievements **inside your own game**, and reward the player in **your own currency**.
+That was already the only thing a game's achievements could do — they were never worth any Flux
+Coins — so for most games this changes nothing but where the code lives.
 
 ## Leaderboards
 
@@ -248,7 +237,7 @@ you would not want to undo.
 ## Testing it
 
 **SDK Assessment** (admin or dashboard) speaks the same bridge protocol the real game window
-does. Point it at your game's URL, and it shows you the leaderboard, achievements, wallet and
+does. Point it at your game's URL, and it shows you the leaderboard, wallet and
 save your game actually produced — not just the traffic. It also catches the silent failures:
 a manifest the importer would drop, a score submitted to a board you never declared, a save
 key that never moves.
@@ -261,5 +250,4 @@ key that never moves.
 - [ ] `data.onChange` re-reads the save rather than keeping the old values.
 - [ ] Rewarded ads grant **only** on `rewarded: true`, and the skip path is tested.
 - [ ] Wallet uses `spend()`, and grants nothing until it resolves `ok`.
-- [ ] Achievement manifest entries all have `shareWithPlatform: true` and `rewardFlux > 0`.
 - [ ] Preview mode writes nothing permanent.

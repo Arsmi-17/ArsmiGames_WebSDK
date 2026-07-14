@@ -95,8 +95,6 @@ $("btnFullscreen").addEventListener("click", () => Platform.requestFullscreen())
 $("btnMute").addEventListener("click", () => Platform.setMuted(!Platform.state.muted));
 $("btnWallet").addEventListener("click", () => Platform.spend(0, "noop"));
 $("btnAd").addEventListener("click", () => void Platform.showRewardedAd("sdk-console"));
-$("btnAchv").addEventListener("click", () => Platform.defineAchievements());
-$("btnProgress").addEventListener("click", () => Platform.achievementProgress("quiz_correct", 1));
 $("btnBoard").addEventListener("click", () => Platform.defineLeaderboard());
 $("btnScore").addEventListener("click", () => Platform.submitScore(100));
 $("btnDump").addEventListener("click", () => {
@@ -119,7 +117,6 @@ refreshChips();
 void Platform.connect().then(() => {
   // Declare the manifest and the board once, after the handshake. Doing it before means
   // shouting into a void — there is nobody on the other end of the bridge yet.
-  Platform.defineAchievements();
   Platform.defineLeaderboard();
   quiz.load();
   refreshChips();

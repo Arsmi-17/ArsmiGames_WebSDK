@@ -31,6 +31,7 @@ export const Platform = (() => {
     saveMode: "no",       // "no" | "sdk" | "backend" — set by the platform, not by you
     fluxCoins: null,
     muted: false,
+    fullscreen: false,
     ready: false,
   };
 
@@ -67,10 +68,26 @@ export const Platform = (() => {
     emit("mute", state);
   });
 
+  // ---- fullscreen ----------------------------------------------------------
+  // Subscribe at boot, not when the player clicks something. The platform's fullscreen
+  // button resizes the frame around you, and a game that only finds out about fullscreen
+  // when it asks for it will render at the wrong size when the platform does the asking.
+  //
+  // The platform also treats this subscription as the proof that you handle fullscreen at
+  // all, and refuses to publish a game that never registers it.
+  sdk?.on?.("set_fullscreen", ({ fullscreen }) => {
+    state.fullscreen = !!fullscreen;
+    log(`fullscreen ${fullscreen ? "entered" : "exited"}`, "in");
+    // A canvas game would resize its renderer here.
+  });
+
   // ---- wallet --------------------------------------------------------------
-  // The balance is whatever the SERVER says it is. The game reads it and asks to spend from
-  // it; it never decides what is in it. Coins are EARNED through rewarded ads and
-  // achievements, both of which the platform grants after it has seen the thing happen.
+  // The balance is whatever the SERVER says it is. A game READS it and asks to SPEND from it.
+  // There is no way to add to it — not through this object, not through sdk.emit(), which
+  // refuses the message outright. Flux is real money: the player buys it, or the PLATFORM
+  // grants it for watching the PLATFORM's own ad.
+  //
+  // That includes ads your game asks for. They pay out in YOUR currency, not in Flux.
   sdk?.wallet?.onChange?.(({ fluxCoins }) => {
     state.fluxCoins = fluxCoins;
     log(`wallet:state — ${fluxCoins} flux`, "in");
@@ -149,51 +166,6 @@ export const Platform = (() => {
       const result = await sdk.ads.showRewarded({ placement });
       this.log(result.rewarded ? "← ad:rewarded" : "← ad:dismissed — no reward", "in");
       return result;
-    },
-
-    // ---- achievements ----------------------------------------------------
-    /**
-     * Define once at startup.
-     *
-     * Every field here is load-bearing. The platform's importer SKIPS any entry missing one
-     * — silently, with no error and no log line — so an achievement without rewardFlux, or
-     * without shareWithPlatform, simply never comes into existence and the game has no way
-     * to find out. The two easy ones to forget are exactly those two.
-     *
-     * Check your manifest in SDK Assessment; it lists what would be thrown away.
-     */
-    defineAchievements() {
-      sdk?.achievements?.define?.({
-        achievements: [
-          {
-            key: "quiz_first_correct",
-            title: "Bright spark",
-            description: "Answer your first question correctly.",
-            metric: "quiz_correct",
-            target: 1,
-            rewardFlux: 10,
-            type: "daily",
-            shareWithPlatform: true,
-          },
-          {
-            key: "quiz_ten_correct",
-            title: "Quiz whiz",
-            description: "Answer 10 questions correctly.",
-            metric: "quiz_correct",
-            target: 10,
-            rewardFlux: 50,
-            type: "daily",
-            shareWithPlatform: true,
-          },
-        ],
-      });
-      this.log("→ achievements:manifest", "out");
-    },
-
-    /** The metric MUST match a manifest entry's `metric`, or it counts towards nothing. */
-    achievementProgress(metric, amount = 1) {
-      sdk?.achievements?.progress?.({ metric, amount });
-      this.log(`→ achievement:progress ${metric} +${amount}`, "out");
     },
 
     // ---- leaderboard -----------------------------------------------------

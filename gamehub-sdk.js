@@ -5,6 +5,71 @@
   var BRIDGE_READY = "gamehub:bridge:ready";
   var BRIDGE_EVENT = "gamehub:bridge:event";
   var BRIDGE_LOG = "gamehub:bridge:log";
+  var ACK = "gamehub:ack";
+
+  // ---- Acknowledgements ----------------------------------------------------
+  //
+  // Every message that carries an `id` gets one back. It is a receipt, and it answers the
+  // one question neither side can otherwise ask: did you actually do anything with that?
+  //
+  // Delivery is not the interesting part — postMessage does not lose messages. `handled` is.
+  // The platform can watch what a game SENDS, but a game *receiving* set_mute and honouring
+  // it produces no traffic at all, so from outside, a game that mutes itself and a game that
+  // ignores the volume button look identical. The ack is the game's own code path answering
+  // for itself.
+
+  /**
+   * Which subscriptions count as handling a given inbound message.
+   *
+   * A game handles mute by calling onMute(), which subscribes to gamehub:audio:muted — NOT to
+   * set_mute, which the SDK itself consumes. Counting handlers on set_mute alone would report
+   * "unhandled" for a game that handles mute perfectly.
+   */
+  var ACK_PROOF = {
+    "set_mute": ["set_mute", "gamehub:audio:muted"],
+    "set_fullscreen": ["set_fullscreen"],
+    "gamehub:data:state": ["gamehub:data:state", "gamehub:data:changed"],
+    "gamehub:user:state": ["gamehub:user:state"],
+    "gamehub:wallet:state": ["gamehub:wallet:state", "gamehub:wallet:changed"],
+    "gamehub:ad:state": ["gamehub:ad:state", "gamehub:ad:finished"],
+  };
+
+  /**
+   * The messages Unity answers for itself, from C#.
+   *
+   * GameHubBridge.jslib subscribes to these on the game's behalf whether or not the C# does
+   * anything with them — it has to, it cannot know what the game will want. So a JS-side ack
+   * would answer "handled" for every Unity build ever made, including one that ignores the
+   * platform's volume button entirely. GameHubBridge.cs looks at its own event subscriptions
+   * and answers honestly through ackEvent().
+   */
+  var UNITY_ACKS = { "set_mute": true, "set_fullscreen": true };
+
+  /**
+   * Events a game is not allowed to send, ever.
+   *
+   * Two kinds live here.
+   *
+   * The wallet ones: a game may READ its player's Flux balance and SPEND from it, and may never
+   * add to it. Flux is real currency — it is bought, or granted by the platform for watching a
+   * platform ad. A game earning it would be a game printing money. Deleting wallet.set() from
+   * the API below is not enough on its own, because emit() is a generic escape hatch and
+   * `sdk.emit("gamehub:wallet:set", { fluxCoins: 1e9 })` is one line. So the refusal lives here,
+   * at the only door out of the iframe.
+   *
+   * The achievement ones: the platform no longer has achievements at all. A game built against
+   * the old SDK still calls these, and it deserves to be told so — in its own console, by name —
+   * rather than emitting into a void for ever and wondering why nothing shows up.
+   *
+   * The platform rejects all of these too. This is the half that says why.
+   */
+  var FORBIDDEN_EMITS = {
+    "gamehub:wallet:set": "A game cannot increase Flux Coins. Read with wallet.get(), take with wallet.spend().",
+    "gamehub:wallet:add": "A game cannot increase Flux Coins. Read with wallet.get(), take with wallet.spend().",
+    "gamehub:wallet:earn": "A game cannot increase Flux Coins. Read with wallet.get(), take with wallet.spend().",
+    "gamehub:achievements:manifest": "The platform no longer has achievements. Track them inside your own game.",
+    "gamehub:achievement:progress": "The platform no longer has achievements. Track them inside your own game.",
+  };
 
   function isObject(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
@@ -20,16 +85,52 @@
       pocketConsole: !!(options.capabilities && options.capabilities.pocketConsole),
       fullscreen: !options.capabilities || options.capabilities.fullscreen !== false,
       mute: !options.capabilities || options.capabilities.mute !== false,
-      achievements: !options.capabilities || options.capabilities.achievements !== false,
       leaderboard: !options.capabilities || options.capabilities.leaderboard !== false,
     };
     this.handlers = {};
+    // How many of handlers[type] are the SDK's own. Anything above this count is the game's,
+    // and only the game's count as evidence that the game handles something.
+    this._internalCounts = {};
     this.destroyed = false;
     this.context = { preview: false };
+
+    // Acks. `_outSeq` numbers what we send; `_unityAcks` parks the id of a message we have
+    // handed to C# and are waiting for it to answer for.
+    this._outSeq = 0;
+    this._unityAcks = {};
+    this._dispatchErrors = 0;
+
+    // ---- what the game ACTUALLY wired up -----------------------------------
+    //
+    // `capabilities` above is DECLARED — it defaults to true, so a game that does
+    // nothing at all still claims it handles mute. Anything gated on it is theatre.
+    //
+    // This is different: each flag is set only when the game really registers a handler
+    // or calls the API. It is what the platform checks before letting a game be
+    // published, because "the platform sent set_mute" and "the game muted itself" are
+    // not the same fact, and only the second one matters to a player.
+    this._wired = {
+      mute: false,        // subscribed to set_mute (the platform's volume button)
+      fullscreen: false,  // subscribed to set_fullscreen, or asks for it
+      data: false,        // uses the save API at all
+      user: false,        // reads who the player is (needed for own-backend saves)
+      wallet: false,
+      ads: false,
+      leaderboard: false,
+    };
+    // Unity reports its own wiring from C# — the .jslib subscribes to everything on the
+    // game's behalf, so inferring from JS handlers there would mark every Unity game as
+    // compliant regardless of what its C# does. See setWiring() and UNITY_ACKS.
+    this._autoWiring = options.engine !== "unity";
+    this._autoAck = options.engine !== "unity";
+
     this._onMessage = this._onMessage.bind(this);
     window.addEventListener("message", this._onMessage);
 
     var self = this;
+
+    this._onInternal("gamehub:capabilities:get", function () { self._reportCapabilities(); });
+    this._onInternal(ACK, function (payload) { self._onHostAck(payload); });
     this.challenge = {
       ready: function (payload) { self.emit("gamehub:challenge:ready", payload || {}); },
       updateState: function (payload) { self.emit("gamehub:challenge:state", payload || {}); },
@@ -45,11 +146,6 @@
       onPlayerJoined: function (handler) { return self.on("gamehub:pocket:player_joined", handler); },
       onPlayerReconnected: function (handler) { return self.on("gamehub:pocket:player_reconnected", handler); },
       onPlayerLeft: function (handler) { return self.on("gamehub:pocket:player_left", handler); },
-    };
-    this.achievements = {
-      define: function (payload) { self.emit("gamehub:achievements:manifest", payload || {}); },
-      progress: function (payload) { self.emit("gamehub:achievement:progress", payload || {}); },
-      onSharing: function (handler) { return self.on("gamehub:achievements:sharing", handler); },
     };
     this.leaderboard = {
       define: function (payload) { self.emit("gamehub:leaderboard:define", payload || {}); },
@@ -73,8 +169,8 @@
       pending: null,        // resolve fns for flush() callers
       readyResolvers: [],
     };
-    this.on("gamehub:data:state", function (payload) { self._onDataState(payload); });
-    this.on("gamehub:data:error", function (payload) {
+    this._onInternal("gamehub:data:state", function (payload) { self._onDataState(payload); });
+    this._onInternal("gamehub:data:error", function (payload) {
       var message = (payload && payload.message) || "Save failed.";
       if (console && console.warn) console.warn("[GameHubSDK] data: " + message);
       self._dispatch("gamehub:data:failed", { message: message });
@@ -82,10 +178,12 @@
 
     this.data = {
       getItem: function (key) {
+        self._wire("data");
         var value = self._save.cache[String(key)];
         return typeof value === "string" ? value : null;
       },
       setItem: function (key, value) {
+        self._wire("data");
         if (!self._requireSaveMode()) return;
         self._save.cache[String(key)] = String(value);
         self._scheduleFlush();
@@ -110,13 +208,18 @@
     };
 
     // ---- Wallet ----------------------------------------------------------
-    // Flux Coins are real currency, so the balance is whatever the SERVER says it
-    // is — never what the game says it is. The game can read it, and it can ask to
-    // spend it (the server checks the player can afford it and does the arithmetic).
-    // Earning is not in here on purpose: coins come from rewarded ads and achievement
-    // claims, both of which the platform decides.
+    // Flux Coins are real currency, so the balance is whatever the SERVER says it is —
+    // never what the game says it is.
+    //
+    // A game can READ the balance and ask to SPEND from it. There is no way to add to it,
+    // and that is not an oversight: coins are bought from the platform, or granted by the
+    // platform for watching a PLATFORM ad. A game that could add to the balance would be a
+    // game printing money.
+    //
+    // This includes rewarded ads a game asks for. Those pay out in the GAME's own currency —
+    // clear the boss, unlock the skin — and the game grants that itself. They do not pay Flux.
     this._wallet = { fluxCoins: null, currency: "flux", rate: 1, pending: [] };
-    this.on("gamehub:wallet:state", function (payload) {
+    this._onInternal("gamehub:wallet:state", function (payload) {
       payload = payload || {};
       if (typeof payload.fluxCoins === "number") self._wallet.fluxCoins = payload.fluxCoins;
       if (typeof payload.currency === "string") self._wallet.currency = payload.currency;
@@ -124,7 +227,7 @@
       self._resolveWallet({ ok: true, fluxCoins: self._wallet.fluxCoins });
       self._dispatch("gamehub:wallet:changed", self.wallet.get());
     });
-    this.on("gamehub:wallet:error", function (payload) {
+    this._onInternal("gamehub:wallet:error", function (payload) {
       var message = (payload && payload.message) || "Wallet call failed.";
       self._resolveWallet({ ok: false, error: message, fluxCoins: self._wallet.fluxCoins });
       self._dispatch("gamehub:wallet:failed", { message: message });
@@ -141,6 +244,7 @@
       },
       /** Asks the platform for the current balance. Resolves with { ok, fluxCoins }. */
       fetch: function () {
+        self._wire("wallet");
         self.emit("gamehub:wallet:get", { currency: self._wallet.currency, rate: self._wallet.rate });
         return self._awaitWallet();
       },
@@ -148,6 +252,8 @@
        * Spends `amount` coins. The SERVER checks the balance covers it, so this can
        * fail: resolves { ok: false, error } if the player cannot afford it. Do not
        * hand out whatever was bought until this resolves ok.
+       *
+       * This is the only way a game may move the balance, and it only moves it down.
        */
       spend: function (amount, reason) {
         var value = Number(amount);
@@ -155,16 +261,6 @@
           return Promise.resolve({ ok: false, error: "Spend amount must be a positive number." });
         }
         self.emit("gamehub:wallet:spend", { amount: value, reason: String(reason || "game") });
-        return self._awaitWallet();
-      },
-      /**
-       * @deprecated Writes an ABSOLUTE balance and is trusted as-is, so a game can mint
-       * currency with it. Use spend() to take coins; coins are earned through rewarded
-       * ads and achievements, which the platform grants. Kept only so already-published
-       * games keep working.
-       */
-      set: function (fluxCoins) {
-        self.emit("gamehub:wallet:set", { fluxCoins: Number(fluxCoins) || 0 });
         return self._awaitWallet();
       },
       onChange: function (handler) { return self.on("gamehub:wallet:changed", handler); },
@@ -176,7 +272,7 @@
     // the game must honour it or the button is a lie. When the game mutes itself, it
     // sends audio_muted so the platform's icon matches what the player hears.
     this._muted = false;
-    this.on("set_mute", function (payload) {
+    this._onInternal("set_mute", function (payload) {
       var next = !!(payload && payload.muted);
       if (next === self._muted) return;
       self._muted = next;
@@ -184,11 +280,18 @@
     });
 
     // ---- Ads -------------------------------------------------------------
-    // The ad is a PLATFORM overlay. The game never renders it, never times it, and
-    // never decides whether it was watched — the reward is real currency, so that
-    // call stays outside the iframe. The game asks, pauses itself, and waits.
+    // The ad is a PLATFORM overlay. The game never renders it, never times it, and never
+    // decides whether it was watched — a game cannot be trusted to report that, so the
+    // decision stays outside the iframe. The game asks, pauses itself, and waits.
+    //
+    // What it pays out is the GAME's business. An ad the game asked for grants nothing in
+    // Flux Coins: you clear the boss level, you unlock the skin, you refill the lives —
+    // whatever your game's own economy says, granted by your own code when rewarded is true.
+    //
+    // (The platform has its own "watch an ad for Flux" button in its UI. That one is the
+    // platform's, the player starts it deliberately, and it has nothing to do with a game.)
     this._ad = { pending: null };
-    this.on("gamehub:ad:state", function (payload) {
+    this._onInternal("gamehub:ad:state", function (payload) {
       payload = payload || {};
       var status = String(payload.status || "");
       if (status === "started") {
@@ -199,7 +302,6 @@
       self._ad.pending = null;
       var result = {
         rewarded: status === "rewarded",
-        balance: typeof payload.balance === "number" ? payload.balance : null,
         reason: payload.reason || null,
       };
       self._dispatch("gamehub:ad:finished", result);
@@ -208,10 +310,17 @@
 
     this.ads = {
       /**
-       * Shows a rewarded ad and resolves with { rewarded, balance }.
-       * `rewarded: false` means the player skipped it or it failed — do not pay out.
+       * Shows a rewarded ad and resolves with { rewarded, reason }.
+       *
+       * `rewarded: true` means the player watched it to the end — now grant whatever YOUR
+       * game promised them. `rewarded: false` means they skipped it or it failed: grant
+       * nothing.
+       *
+       * This does not pay Flux Coins and never did anything useful with them. There is no
+       * `balance` in the result, because there is no balance change to report.
        */
       showRewarded: function (payload) {
+        self._wire("ads");
         if (self._ad.pending) return Promise.resolve({ rewarded: false, reason: "already-showing" });
         self.emit("gamehub:ad:show", Object.assign({ type: "rewarded" }, payload || {}));
         return new Promise(function (resolve) { self._ad.pending = resolve; });
@@ -226,7 +335,7 @@
       },
       onChange: function (handler) { return self.on("gamehub:user:state", handler); },
     };
-    this.on("gamehub:user:state", function (payload) {
+    this._onInternal("gamehub:user:state", function (payload) {
       self._user = payload || {};
       self._save.loggedIn = !!(payload && payload.loggedIn);
     });
@@ -247,6 +356,7 @@
   /** Resolves once the platform has handed us the player's save. */
   GameHubSDK.prototype.init = function () {
     var self = this;
+    this._wire("data");
     if (this._save.loaded) return Promise.resolve(this.data.getAll());
     return new Promise(function (resolve) {
       self._save.readyResolvers.push(resolve);
@@ -373,7 +483,163 @@
     window.removeEventListener("message", this._onMessage);
   };
 
+  /** The SDK's own subscriptions. Deliberately does NOT count as the game wiring anything
+   *  up — otherwise every game would look compliant because the SDK subscribed for it. */
+  GameHubSDK.prototype._onInternal = function (type, handler) {
+    if (!this.handlers[type]) this.handlers[type] = [];
+    this.handlers[type].push(handler);
+    this._internalCounts[type] = (this._internalCounts[type] || 0) + 1;
+    return function () {};
+  };
+
+  /** How many handlers on `type` belong to the GAME. The SDK's own do not count. */
+  GameHubSDK.prototype._gameHandlers = function (type) {
+    var total = (this.handlers[type] || []).length;
+    return Math.max(0, total - (this._internalCounts[type] || 0));
+  };
+
+  /** Did the game do anything with this message? */
+  GameHubSDK.prototype._isHandled = function (event) {
+    // A handler that threw did not handle anything. Saying otherwise would send the
+    // developer looking for a missing subscription that is right there.
+    if (this._dispatchErrors > 0) return false;
+    var types = ACK_PROOF[event] || [event];
+    for (var i = 0; i < types.length; i++) {
+      if (this._gameHandlers(types[i]) > 0) return true;
+    }
+    return false;
+  };
+
+  GameHubSDK.prototype._maybeAck = function (id, event) {
+    if (!id || event === ACK) return;  // never acknowledge an acknowledgement
+    if (!this._autoAck && UNITY_ACKS[event]) {
+      // Unity answers this one itself. Park the id: the .jslib has just handed the message
+      // to C#, and C# will call ackEvent() once it knows whether the game is listening.
+      this._unityAcks[event] = id;
+      return;
+    }
+    this.ack(id, event, this._isHandled(event));
+  };
+
+  /** Answers one message by id. */
+  GameHubSDK.prototype.ack = function (id, event, handled) {
+    if (!id) return;
+    this._send(BRIDGE_EVENT, {
+      event: ACK,
+      name: ACK,
+      payload: {
+        id: String(id),
+        event: String(event || ""),
+        handled: !!handled,
+        source: this._autoAck ? "sdk" : "unity",
+      },
+    });
+  };
+
+  /** Unity's answer for a message we parked in _maybeAck. Called from C# via the .jslib. */
+  GameHubSDK.prototype.ackEvent = function (event, handled) {
+    var id = this._unityAcks[event];
+    if (!id) return;
+    delete this._unityAcks[event];
+    this.ack(id, event, handled);
+  };
+
+  /** The platform answering something WE sent. */
+  GameHubSDK.prototype._onHostAck = function (payload) {
+    payload = payload || {};
+    if (payload.handled === false && console && console.warn) {
+      // The platform received it and did nothing with it. Nearly always a misspelt event
+      // name, which is otherwise completely silent — the game keeps emitting into a void.
+      console.warn(
+        "[GameHubSDK] the platform does not handle \"" + String(payload.event || "") + "\". " +
+        "Check the event name — nothing is listening for it."
+      );
+    }
+  };
+
+  /** Fires when the platform answers a message this game sent. Payload: { id, event, handled }. */
+  GameHubSDK.prototype.onAck = function (handler) {
+    return this.on(ACK, handler);
+  };
+
+  /** Which requirement a given subscription satisfies. */
+  var WIRES = {
+    "set_mute": "mute",
+    "set_fullscreen": "fullscreen",
+    "gamehub:data:changed": "data",
+    "gamehub:user:state": "user",
+    "gamehub:wallet:changed": "wallet",
+    "gamehub:ad:finished": "ads",
+    "gamehub:leaderboard:sharing": "leaderboard",
+    "gamehub:audio:muted": "mute",
+  };
+
+  GameHubSDK.prototype._wire = function (name) {
+    if (this._autoWiring && name) this._wired[name] = true;
+  };
+
+  /**
+   * Unity reports its own wiring, from C#.
+   *
+   * The .jslib subscribes to set_mute, set_fullscreen and the rest on the game's behalf,
+   * whether or not the game's C# does anything with them. So inferring wiring from JS
+   * handlers in a Unity build would mark every Unity game as compliant — including one
+   * that ignores the platform's volume button entirely. GameHubBridge.cs looks at its own
+   * event subscriptions instead and tells us the truth.
+   */
+  GameHubSDK.prototype.setWiring = function (partial) {
+    if (!isObject(partial)) return;
+    for (var key in this._wired) {
+      if (typeof partial[key] === "boolean") this._wired[key] = partial[key];
+    }
+    // Push it, do not wait to be asked. C# reports a frame into the game's life, which may
+    // be long after the host gave up asking — a Unity build can take ten seconds to boot.
+    this._reportCapabilities();
+  };
+
+  GameHubSDK.prototype.getWiring = function () {
+    return Object.assign({}, this._wired);
+  };
+
+  /**
+   * Switches an SDK that already exists into Unity mode.
+   *
+   * The .jslib cannot get this from create({ engine: "unity" }). The WebGL template loads
+   * gamehub-sdk.js in <head> — deliberately, the build is not allowed to ship without it — so
+   * by the time Unity's GameHubBridge_Init runs, window.GameHubBridge is already here and the
+   * create() call is skipped entirely.
+   *
+   * Which means every Unity build was running in auto-wiring mode, inferring what the game
+   * implements from JavaScript subscriptions... which in a Unity build are the .jslib's own,
+   * made on the game's behalf, unconditionally. Every requirement came back "wired". That is
+   * the exact false pass the wiring report exists to prevent, and it was hiding inside the
+   * mechanism meant to prevent it.
+   */
+  GameHubSDK.prototype.setEngine = function (engine) {
+    var unity = engine === "unity";
+    this._autoWiring = !unity;
+    this._autoAck = !unity;
+    if (unity) {
+      // Anything already inferred came from JS subscriptions, and in Unity those are not the
+      // game's. C# is about to report the truth; start it from nothing.
+      for (var key in this._wired) this._wired[key] = false;
+    }
+  };
+
+  GameHubSDK.prototype._reportCapabilities = function () {
+    this.emit("gamehub:capabilities:state", {
+      sdk: "@gamehub/sdk",
+      version: "0.1.0",
+      // What the game SAYS it supports. Defaults to true — do not gate on it.
+      declared: Object.assign({}, this.capabilities),
+      // What the game actually wired up. Gate on this.
+      wired: this.getWiring(),
+      saveMode: this._save.mode,
+    });
+  };
+
   GameHubSDK.prototype.on = function (type, handler) {
+    this._wire(WIRES[type]);
     if (!this.handlers[type]) this.handlers[type] = [];
     this.handlers[type].push(handler);
     var list = this.handlers[type];
@@ -383,8 +649,18 @@
     };
   };
 
+  /** Sends an event to the platform. Returns the id the platform will acknowledge it by. */
   GameHubSDK.prototype.emit = function (event, payload) {
-    this._send(BRIDGE_EVENT, { event: event, name: event, payload: payload || {} });
+    var refusal = FORBIDDEN_EMITS[event];
+    if (refusal) {
+      // Refused here rather than sent-and-rejected, so it is impossible to mistake for a
+      // network problem or a platform bug. The message never leaves the iframe.
+      if (console && console.error) console.error("[GameHubSDK] refusing to send \"" + event + "\". " + refusal);
+      return null;
+    }
+    var id = "g" + (++this._outSeq);
+    this._send(BRIDGE_EVENT, { id: id, event: event, name: event, payload: payload || {} });
+    return id;
   };
 
   GameHubSDK.prototype.log = function (level, message, data) {
@@ -392,11 +668,13 @@
   };
 
   GameHubSDK.prototype.requestPlatformFullscreen = function (orientation) {
+    this._wire("fullscreen");
     this.emit("fullscreen_request", { orientation: orientation || "auto" });
   };
 
   /** Tells the platform the game muted/unmuted itself, so its volume icon matches. */
   GameHubSDK.prototype.setMuted = function (muted) {
+    this._wire("mute");
     var next = !!muted;
     // The platform echoes its own set_mute back to us. Without this guard that echo
     // would bounce straight back out as audio_muted and the two would ping-pong.
@@ -473,13 +751,30 @@
     }
     var eventType = data.type === BRIDGE_EVENT && typeof data.event === "string" ? data.event : data.type;
     var payload = data.type === BRIDGE_EVENT && isObject(data.payload) ? data.payload : data;
+
+    // Reset before the top-level dispatch, not inside it: handling set_mute runs a nested
+    // dispatch of gamehub:audio:muted, and a throw in the game's mute handler happens down
+    // there. It still has to count against the ack for set_mute.
+    this._dispatchErrors = 0;
     this._dispatch(eventType, payload);
+    if (typeof data.id === "string") this._maybeAck(data.id, eventType);
   };
 
   GameHubSDK.prototype._dispatch = function (type, payload) {
     if (this.debug && console && console.debug) console.debug("[GameHubSDK] recv", type, payload);
+    var self = this;
     var list = this.handlers[type] || [];
-    list.slice().forEach(function (handler) { handler(payload); });
+    list.slice().forEach(function (handler) {
+      // One game's broken handler must not take the bridge down with it. Without this, a
+      // throw here escapes into the window's message listener and every later message in
+      // the same dispatch is skipped — including the ack that would have reported it.
+      try {
+        handler(payload);
+      } catch (err) {
+        self._dispatchErrors++;
+        if (console && console.error) console.error("[GameHubSDK] a handler for " + type + " threw", err);
+      }
+    });
   };
 
   GameHubSDK.prototype._send = function (type, payload) {
@@ -492,6 +787,6 @@
   window.GameHubSDK = GameHubSDK;
   window.GameHubBridge = window.GameHubBridge || GameHubSDK.create({
     debug: false,
-      capabilities: { challenge: true, pocketConsole: true, fullscreen: true, mute: true, achievements: true, leaderboard: true },
+      capabilities: { challenge: true, pocketConsole: true, fullscreen: true, mute: true, leaderboard: true },
     });
 })();

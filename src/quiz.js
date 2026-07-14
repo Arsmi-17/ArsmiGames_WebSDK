@@ -73,8 +73,6 @@ export function createQuiz(platform, save, els) {
       els.feedback.className = "feedback good";
 
       // The metric must match a manifest entry's `metric` exactly, or this counts towards
-      // nothing at all — silently. See Platform.defineAchievements.
-      platform.achievementProgress("quiz_correct", 1);
 
       if (score > best) {
         best = score;
