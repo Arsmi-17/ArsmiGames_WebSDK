@@ -76,6 +76,31 @@ not hang — which is exactly what would happen if you awaited a message that ne
 Declare your leaderboard **after** the handshake. Before it, you are
 shouting into a void: there is nobody on the other end of the bridge yet.
 
+## The contract, function by function
+
+Every function is one or both of two directions: the **platform sends** your game something and
+expects it honoured, or your **game sends** the platform something. Some checks are required to
+publish; the rest you use only if the feature applies.
+
+The platform proves a game handles an inbound message by sending it a real one and waiting for
+the SDK's **acknowledgement**. For the inbound checks (mute, fullscreen), *subscribing* is what
+acks "handled" — a game that never subscribes is reported as not handling it. Silence never
+counts as a pass.
+
+| Function | Publish? | Platform → game (you must) | Game → platform (you may) |
+|---|---|---|---|
+| **Handshake** | **Required** | `bridge:init` → the SDK auto-replies `bridge:ready` and reports capabilities. Just load the SDK. | — |
+| **Mute** | **Required** | `set_mute` → zero **all** audio channels. Ack is automatic once you call `onMute`. | `setMuted(true)` when your own sliders all reach 0; `false` when any rises. Skip if you have no volume UI. |
+| **Fullscreen** | **Required** | `set_fullscreen` → ack by subscribing `on("set_fullscreen", …)`; re-fit a fixed canvas. | `requestPlatformFullscreen()` — **only** if your game already has a fullscreen button. Do not add one. |
+| **Identity** | Required for **own-backend** save | `user.onChange(({ playerId }) => …)` → key your saves on `playerId`. | `user.get()` to ask for it. |
+| **Save (Platform)** | Required if published **Platform save** | `data.onChange` → re-read the save, do not keep stale values. | `data.setItem/getItem/clear`. **Never store currency in a save** — it is on the player's machine and editable. |
+| **Wallet (Flux)** | Only if you sell for Flux | `wallet.onChange(balance => …)` → update your HUD. | `wallet.get()` to read; `wallet.spend(n, reason)` to spend, and wait for `ok` before granting. **A game cannot earn Flux** — `wallet.set/add/earn` are refused before they leave the iframe. |
+| **Rewarded ad** | Optional | The overlay is drawn by the platform; the resolved result carries `rewarded: true/false`. | `await ads.showRewarded({ … })`. Grant **your own** reward only on `rewarded: true`. **An ad pays no Flux.** |
+| **Leaderboard** | Optional | `leaderboard.onSharing(({ enabled }) => …)` → show/hide your share button. | `leaderboard.define(boards)` **first**, then `submitScore({ metricKey, score })` against a declared key. |
+| **Achievements** | — | — | **Removed.** No manifest, no progress, **no Flux reward.** Track them in your own game and currency. |
+
+The rest of this file is that table in detail, one section per row.
+
 ## Save data — the three modes
 
 These are the three answers to *"Does your game save progress?"* in the publish wizard. A
@@ -200,29 +225,139 @@ Coins — so for most games this changes nothing but where the code lives.
 
 ## Leaderboards
 
+Optional — a game with no ranking does not need this. But if you use it, two rules decide
+whether it works, and both fail silently.
+
 ```js
+// 1. DECLARE your boards once, at startup, before any score.
 sdk.leaderboard.define({
   boards: [{ metricKey: "quiz_score", metricLabel: "Quiz score", sortDirection: "desc" }],
 });
+
+// 2. SUBMIT against a metricKey you declared.
 sdk.leaderboard.submitScore({ metricKey: "quiz_score", score: 120 });
 ```
 
-A submit only replaces the stored score when it **beats** it, for that board's sort direction.
-The platform keeps the player's best. A game that assumes every submit overwrites will
-disagree with the platform about what the player's score is.
+**Requirement — define before you submit.** A score whose `metricKey` matches no declared
+board is **dropped**, and nothing errors. The game goes on submitting into nothing and finds
+out never. Declare every board once at startup; then submit as often as you like.
+
+**Requirement — a submit is a "best", not a "set".** The platform keeps the player's best
+score for each board's `sortDirection` (`desc` = higher wins, `asc` = lower/faster wins). A
+submit only replaces the stored value when it **beats** it. A game that reads its own last
+submit back as "the score" will disagree with the platform, which kept the higher earlier one.
+
+**Acknowledgement.** `define` and `submitScore` are outbound — the platform acks each one, and
+a misspelt `metricKey` on submit is the one that silently drops, so keep the key identical to
+what you declared.
+
+**Platform → game — sharing.** The platform tells you whether its "share your score" UI is
+switched on for this embed. Subscribe if you want to show or hide your own share affordance to
+match; ignore it otherwise:
+
+```js
+sdk.leaderboard.onSharing(({ enabled }) => { shareButton.hidden = !enabled; });
+```
+
+You never need `onSharing` to *submit* scores — it only governs a share button, if you have
+one.
 
 ## Mute
 
-Two-way, and both directions matter.
+Two-way, and both directions matter. **Your game does not need a mute button** — the platform
+provides one. Your job is only to make its button real, and to keep it honest if you have
+volume controls of your own.
+
+### Platform → game: silence *everything*
+
+When the platform mutes you, drop **every** audio channel to zero — music, SFX, ambience,
+voice, UI clicks, all of it. "Mute" means the player hears nothing, not "the background music
+stops but the explosions do not."
 
 ```js
-sdk.onMute(({ muted, source }) => { audio.muted = muted; });
-sdk.setMuted(true);      // the game muted itself; the platform's volume icon follows
+sdk.onMute(({ muted }) => {
+  // One master tap that every channel passes through — the simplest correct answer.
+  masterGain.gain.value = muted ? 0 : savedVolume;
+});
 ```
 
-You **must** honour the platform's `set_mute`, or its volume button is a lie. And you must
-send `audio_muted` when the game mutes itself, or the platform shows a speaker icon while the
-player hears nothing. The SDK drops no-op updates, so this cannot ping-pong.
+If your audio does not run through one node, mute each channel by hand — but mute **all** of
+them, or the platform's button is a lie:
+
+```js
+sdk.onMute(({ muted }) => {
+  const level = muted ? 0 : 1;
+  musicGain.gain.value   = level * musicVolume;
+  sfxGain.gain.value     = level * sfxVolume;
+  ambienceGain.gain.value = level * ambienceVolume;
+  // …every channel you have. Missing one is the bug this catches.
+});
+```
+
+The SDK acks the platform's probe for you the moment you call `onMute`, so a game that wires
+this up passes the mute check. A game that never calls `onMute` fails it — silence is not
+evidence that mute works.
+
+### Game → platform: report when *you* go silent
+
+If your game has its own volume sliders — a music slider, an SFX slider — then **all of them at
+zero is the player muting the game**, and the platform's speaker icon should reflect it.
+Whenever a slider moves, tell the platform whether everything is now silent:
+
+```js
+function onVolumeChanged() {
+  const allSilent = musicVolume === 0 && sfxVolume === 0 && ambienceVolume === 0;
+  sdk.setMuted(allSilent);   // true when every channel is 0, false as soon as one is raised
+}
+```
+
+You do not need to guard against spamming this — the SDK drops no-op updates, so calling
+`setMuted(false)` twice, or on every slider tick, sends nothing the second time and cannot
+ping-pong against the platform's own `set_mute`.
+
+If your game has **no** volume controls, you can skip this direction entirely. Honouring
+`onMute` is the only part that is mandatory.
+
+## Fullscreen
+
+**Your game does not need a fullscreen button** — the platform provides one, and clicking it
+resizes the frame around your game. All you have to do is *acknowledge* that you heard it:
+
+```js
+sdk.on("set_fullscreen", ({ fullscreen }) => {
+  // Acknowledged just by subscribing. Nothing else is required.
+});
+```
+
+Subscribing is what makes the fullscreen check pass — it proves your game is listening, rather
+than the platform resizing a frame that will never know it changed.
+
+If your game renders to a fixed-size canvas and needs to re-fit when the frame changes shape,
+this is where you do it:
+
+```js
+sdk.on("set_fullscreen", ({ fullscreen }) => {
+  resizeCanvasToWindow();   // only if your layout is not already CSS-fluid
+});
+```
+
+A game whose canvas is already `width: 100%; height: 100%` needs no body here at all — the
+empty subscription above is enough.
+
+### If your game *has* its own fullscreen button
+
+Then wire it to the platform — do **not** call the browser's `requestFullscreen()` yourself.
+Your game is in an iframe; only the platform can size the frame correctly, and doing it
+yourself fights its chrome:
+
+```js
+myFullscreenButton.onclick = () => sdk.requestPlatformFullscreen();
+```
+
+The platform enters fullscreen and then sends you a `set_fullscreen` back — so the same
+handler above runs, and your button and the platform's button behave identically. **If your
+game has no fullscreen button, do not add one for this** — the platform already provides one.
+Acknowledging `set_fullscreen` is all that is required.
 
 ## Preview mode
 
@@ -246,7 +381,8 @@ key that never moves.
 
 - [ ] The SDK loads, with the local fallback copy shipped next to `index.html`.
 - [ ] The game runs with no platform at all, and does not block on one.
-- [ ] `set_mute` is honoured; `audio_muted` is sent when the game mutes itself.
+- [ ] `onMute` silences **every** audio channel, not just some; `setMuted` is sent when the game's own sliders all reach zero.
+- [ ] `set_fullscreen` is subscribed to (acknowledged), even if the body is empty.
 - [ ] `data.onChange` re-reads the save rather than keeping the old values.
 - [ ] Rewarded ads grant **only** on `rewarded: true`, and the skip path is tested.
 - [ ] Wallet uses `spend()`, and grants nothing until it resolves `ok`.
