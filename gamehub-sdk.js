@@ -7,6 +7,21 @@
   var BRIDGE_LOG = "gamehub:bridge:log";
   var ACK = "gamehub:ack";
 
+  /**
+   * This SDK's version. Kept identical to apps/gamehub-sdk/package.json by sdk:check, which
+   * fails the build if the two disagree.
+   *
+   * It has to mean something, and until 1.0.0 it did not: every SDK ever shipped reported
+   * "0.1.0", including builds from before the platform could ask a game what it implements.
+   * A game arrived claiming the same version as the SDK it was four protocol changes behind,
+   * so the one field that could have named the problem said nothing at all.
+   *
+   * So 0.1.0 now means exactly one thing — old enough to predate the checks — and every
+   * version from here is compared against the platform's own at handshake. Bump it whenever
+   * the wire protocol changes.
+   */
+  var SDK_VERSION = "1.0.0";
+
   // ---- Acknowledgements ----------------------------------------------------
   //
   // Every message that carries an `id` gets one back. It is a receipt, and it answers the
@@ -69,10 +84,26 @@
     "gamehub:wallet:earn": "A game cannot increase Flux Coins. Read with wallet.get(), take with wallet.spend().",
     "gamehub:achievements:manifest": "The platform no longer has achievements. Track them inside your own game.",
     "gamehub:achievement:progress": "The platform no longer has achievements. Track them inside your own game.",
+    // A casino round is answered BY the platform, never announced TO it. If a game could send a
+    // result, it could send itself a win — which is the entire thing the casino design exists to
+    // prevent. Sending a bet is how you play; sending a result is how you would cheat.
+    "gamehub:casino:result": "A game cannot report its own casino result. Send a bet with casino.round() and the server will roll.",
   };
 
   function isObject(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+
+  /** a < b, comparing dotted numeric versions. Missing parts count as 0. */
+  function olderThan(a, b) {
+    var left = String(a || "0").split(".");
+    var right = String(b || "0").split(".");
+    for (var i = 0; i < Math.max(left.length, right.length); i++) {
+      var l = parseInt(left[i], 10) || 0;
+      var r = parseInt(right[i], 10) || 0;
+      if (l !== r) return l < r;
+    }
+    return false;
   }
 
   function GameHubSDK(options) {
@@ -99,6 +130,12 @@
     this._outSeq = 0;
     this._unityAcks = {};
     this._dispatchErrors = 0;
+
+    // The SDK version the platform that served us is on, learnt at handshake, and whether
+    // we are behind it. Null until bridge:init arrives, and stays null when the host is
+    // itself too old to say — an unknown platform version is not evidence of anything.
+    this._platformVersion = null;
+    this._stale = false;
 
     // ---- what the game ACTUALLY wired up -----------------------------------
     //
@@ -267,6 +304,87 @@
       onError: function (handler) { return self.on("gamehub:wallet:failed", handler); },
     };
 
+    // ---- Casino ----------------------------------------------------------
+    //
+    // The one sanctioned way Flux can go UP from inside a game — and it is sanctioned precisely
+    // because the game has no say in it.
+    //
+    //     YOU SEND A BET. YOU NEVER SEND A PAYOUT.
+    //
+    // Look at round() below: there is no parameter for an outcome, a multiplier or a payout.
+    // Not because they are validated away — because they do not exist. The server owns the
+    // paytable, owns the dice, and settles the money in one transaction. Your game is a
+    // renderer for a result that has already happened.
+    //
+    // This only works at all if your game is registered as casino-class by an admin. It is not
+    // something a game can opt into. Every other game calling round() gets refused, which is
+    // why this module being present in the SDK for everyone is harmless.
+    this._casino = { pending: {}, seq: 0 };
+
+    // The FULL event name, exactly as the platform sends it. This said "casino:result" and the
+    // platform sends "gamehub:casino:result", so the reply arrived, matched no handler, and every
+    // round hung on "Rolling…" for ever. Nothing threw — a promise that is never resolved is
+    // indistinguishable from one that is merely slow, which is why this looked like a hang and
+    // not like a bug.
+    this._onInternal("gamehub:casino:result", function (payload) {
+      var key = payload && payload.roundKey;
+      var entry = key ? self._casino.pending[key] : null;
+      if (!entry) return;
+      self._settleCasino(key, payload);
+    });
+
+    this.casino = {
+      /**
+       * Play one round. Resolves with the outcome the SERVER rolled:
+       *
+       *   { ok, outcome, multiplier, bet, payout, balance, nonce, roll, serverSeedHash }
+       *
+       * It can resolve `{ ok: false, code: "insufficient" }` — the player could not afford the
+       * bet. That is an answer, not an error: show them a top-up, do not retry.
+       *
+       * `roundKey` is an idempotency key and it is UNIQUE server-side. If the network drops and
+       * you retry with the same key, you get the SAME result back — you are not charged twice
+       * and you do not get a second spin. Generate one per round and reuse it on retry.
+       */
+      round: function (options) {
+        var opts = options || {};
+        var bet = Math.round(Number(opts.bet));
+        if (!isFinite(bet) || bet <= 0) {
+          return Promise.resolve({ ok: false, error: "Bet must be a positive whole number." });
+        }
+        var mode = String(opts.mode || "").trim();
+        if (!mode) {
+          return Promise.resolve({ ok: false, error: "Missing casino mode." });
+        }
+
+        var key = String(opts.roundKey || "").trim() || self._newRoundKey();
+        var promise = self._awaitCasino(key);
+        self.emit("gamehub:casino:round", { mode: mode, bet: bet, roundKey: key });
+        return promise;
+      },
+
+      /** The current commitment: { serverSeedHash, clientSeed, nonce }. */
+      seed: function () {
+        var key = self._newRoundKey();
+        var promise = self._awaitCasino(key);
+        self.emit("gamehub:casino:seed", { roundKey: key });
+        return promise;
+      },
+
+      /**
+       * Rotate the seed. This REVEALS the old server seed, so the player can recompute every
+       * round they played against it and check we were not lying. Let them set their own
+       * clientSeed — that is the half we do not control, and it is what makes the proof mean
+       * something.
+       */
+      rotateSeed: function (clientSeed) {
+        var key = self._newRoundKey();
+        var promise = self._awaitCasino(key);
+        self.emit("gamehub:casino:rotate", { roundKey: key, clientSeed: clientSeed || null });
+        return promise;
+      },
+    };
+
     // ---- Mute ------------------------------------------------------------
     // Two directions, and both matter. The platform's volume button sends set_mute;
     // the game must honour it or the button is a lie. When the game mutes itself, it
@@ -380,6 +498,62 @@
   // wallet:state either way, so a caller cannot tell "my spend landed" from "someone
   // else's did". Queue the resolvers and settle them all on the next reply: the
   // balance in it is authoritative regardless of which call produced it.
+  /**
+   * How long a round may go unanswered before we call it lost.
+   *
+   * A pending promise nobody ever resolves does not throw, does not log, and does not time out —
+   * it just sits there, and the game sits there with it, showing "Rolling…" for ever. That is
+   * exactly the bug that shipped here: the reply arrived under a name the SDK was not listening
+   * for, and the only symptom was a spinner.
+   *
+   * So a round now always ends. If the platform has not answered in this long, the promise
+   * rejects with something a developer can act on, instead of failing silently and looking slow.
+   */
+  var CASINO_TIMEOUT_MS = 20000;
+
+  /** Register a pending casino call, and guarantee it settles one way or the other. */
+  GameHubSDK.prototype._awaitCasino = function (key) {
+    var self = this;
+    return new Promise(function (resolve) {
+      var timer = setTimeout(function () {
+        self._settleCasino(key, {
+          roundKey: key,
+          ok: false,
+          code: "timeout",
+          error:
+            "The platform did not answer this round within " +
+            CASINO_TIMEOUT_MS / 1000 +
+            "s. The bet may or may not have been placed — retry with the SAME roundKey and you " +
+            "will get the original result rather than a second spin.",
+        });
+      }, CASINO_TIMEOUT_MS);
+      self._casino.pending[key] = { resolve: resolve, timer: timer };
+    });
+  };
+
+  GameHubSDK.prototype._settleCasino = function (key, payload) {
+    var entry = this._casino.pending[key];
+    if (!entry) return;
+    delete this._casino.pending[key];
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.resolve(payload);
+  };
+
+  // An idempotency key for one round. Uniqueness only has to hold per player, and the server
+  // enforces it anyway (the column is UNIQUE) — this just has to not collide with itself.
+  GameHubSDK.prototype._newRoundKey = function () {
+    var rand = "";
+    try {
+      if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+        var buf = new Uint8Array(8);
+        crypto.getRandomValues(buf);
+        for (var i = 0; i < buf.length; i++) rand += buf[i].toString(16).padStart(2, "0");
+      }
+    } catch (_e) {}
+    if (!rand) rand = Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+    return "r" + Date.now().toString(36) + "-" + (++this._casino.seq) + "-" + rand;
+  };
+
   GameHubSDK.prototype._awaitWallet = function () {
     var self = this;
     return new Promise(function (resolve) { self._wallet.pending.push(resolve); });
@@ -629,7 +803,11 @@
   GameHubSDK.prototype._reportCapabilities = function () {
     this.emit("gamehub:capabilities:state", {
       sdk: "@gamehub/sdk",
-      version: "0.1.0",
+      version: SDK_VERSION,
+      // What the platform told us it is on, and whether we are behind it. Reported rather
+      // than inferred by the host: only the SDK knows which version it actually is.
+      platformVersion: this._platformVersion,
+      stale: this._stale,
       // What the game SAYS it supports. Defaults to true — do not gate on it.
       declared: Object.assign({}, this.capabilities),
       // What the game actually wired up. Gate on this.
@@ -739,14 +917,39 @@
             }
           : undefined,
       };
+      // What SDK the platform itself is on. An older host does not send this at all, so
+      // "no answer" means "cannot tell", not "you are current".
+      if (typeof data.sdkVersion === "string" && data.sdkVersion) {
+        this._platformVersion = data.sdkVersion;
+        this._stale = olderThan(SDK_VERSION, data.sdkVersion);
+      }
+
       this._send(BRIDGE_READY, {
         sdk: "@gamehub/sdk",
-        version: "0.1.0",
+        version: SDK_VERSION,
         capabilities: this.capabilities,
         preview: this.context.preview,
       });
       this._dispatch("gamehub:context", this.getContext());
       this.log("info", "GameHub SDK ready");
+
+      // Said in the game's OWN console, because that is where the developer is looking.
+      // The platform says it too, on the assessment screen — but a developer running the
+      // game locally never sees that screen, and a stale SDK is silent by nature: it does
+      // not error, it just fails to answer questions it has never heard of.
+      if (this._stale) {
+        var warn = console && (console.warn || console.log);
+        if (warn) {
+          warn.call(
+            console,
+            "[GameHubSDK] this game bundles SDK " + SDK_VERSION + ", but the platform is on " +
+            this._platformVersion + ". Update the SDK and rebuild — an out-of-date SDK cannot " +
+            "answer checks it does not know about, and the platform will not publish a game it " +
+            "cannot verify."
+          );
+        }
+        this.log("warn", "SDK " + SDK_VERSION + " is older than the platform's " + this._platformVersion);
+      }
       return;
     }
     var eventType = data.type === BRIDGE_EVENT && typeof data.event === "string" ? data.event : data.type;
@@ -783,6 +986,13 @@
     if (this.debug && console && console.debug) console.debug("[GameHubSDK] send", message);
     window.parent.postMessage(message, this.targetOrigin);
   };
+
+  GameHubSDK.prototype.getVersion = function () {
+    return SDK_VERSION;
+  };
+
+  /** Readable without constructing anything: `window.GameHubSDK.VERSION` in the console. */
+  GameHubSDK.VERSION = SDK_VERSION;
 
   window.GameHubSDK = GameHubSDK;
   window.GameHubBridge = window.GameHubBridge || GameHubSDK.create({
