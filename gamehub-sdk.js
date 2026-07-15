@@ -185,8 +185,13 @@
       onPlayerLeft: function (handler) { return self.on("gamehub:pocket:player_left", handler); },
     };
     this.leaderboard = {
-      define: function (payload) { self.emit("gamehub:leaderboard:define", payload || {}); },
-      submitScore: function (payload) { self.emit("gamehub:leaderboard:score", payload || {}); },
+      // Declaring a board or posting a score IS using the leaderboard, so both mark it wired.
+      // Without this, a game that submits scores but never subscribes to onSharing reported
+      // leaderboard:false — the platform's assessment then showed "leaderboard not used" for a
+      // game visibly posting scores. (_wire is a no-op in Unity mode, where C# reports its own
+      // wiring; this is for web games, which infer wiring from what they call.)
+      define: function (payload) { self._wire("leaderboard"); self.emit("gamehub:leaderboard:define", payload || {}); },
+      submitScore: function (payload) { self._wire("leaderboard"); self.emit("gamehub:leaderboard:score", payload || {}); },
       onSharing: function (handler) { return self.on("gamehub:leaderboard:sharing", handler); },
     };
 
