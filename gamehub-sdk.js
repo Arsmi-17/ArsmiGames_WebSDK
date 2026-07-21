@@ -20,7 +20,7 @@
    * version from here is compared against the platform's own at handshake. Bump it whenever
    * the wire protocol changes.
    */
-  var SDK_VERSION = "1.0.0";
+  var SDK_VERSION = "1.0.1";
 
   // ---- Acknowledgements ----------------------------------------------------
   //
@@ -452,6 +452,22 @@
       onFinished: function (handler) { return self.on("gamehub:ad:finished", handler); },
     };
 
+    /**
+     * Who is playing.
+     *
+     * get() -> {
+     *   loggedIn, userId, playerId, username, displayName, avatarPath, playerCode,
+     *   email, emailShared
+     * }
+     *
+     * `playerId` is the one to key your own records on: pseudonymous, stable for this
+     * player in this game, and deliberately NOT comparable across games.
+     *
+     * `email` is null unless the platform granted this game the per-game email opt-in
+     * and the game saves to its own backend — so it is null for most games, and for
+     * every guest. `emailShared` tells you which of those two it is. Never build login
+     * on it; it can be null forever and is not yours to assume.
+     */
     this.user = {
       get: function () {
         return Object.assign({ loggedIn: self._save.loggedIn }, self._user || {});
@@ -964,8 +980,31 @@
     // dispatch of gamehub:audio:muted, and a throw in the game's mute handler happens down
     // there. It still has to count against the ack for set_mute.
     this._dispatchErrors = 0;
+
+    // Unity's ack id is parked BEFORE the dispatch, and only Unity's.
+    //
+    // SendMessage into Unity is synchronous, so the whole chain — .jslib handler, C#
+    // OnGameHubMuted, C# Ack(), ackEvent() — runs to completion inside _dispatch below.
+    // Parking afterwards meant ackEvent() looked for an id that had not been parked yet,
+    // found nothing, and took its `if (!id) return` — dropping the answer silently. The id
+    // was then parked for a reply that had already come and gone, so it sat there for ever
+    // and the platform never heard from the game at all.
+    //
+    // What it saw instead was the auto-ack from the probe sent before Unity had booted,
+    // which correctly reported handled:false — nothing was listening yet. That "no" was the
+    // game's only answer on record, while C# reported the wiring as present, and a game that
+    // handles mute perfectly failed to publish for not answering a question it had answered.
+    //
+    // The auto-ack path still runs AFTER the dispatch: it reads _dispatchErrors and the
+    // handler count, and both only mean anything once the handlers have actually run.
+    var id = typeof data.id === "string" ? data.id : null;
+    var parked = false;
+    if (id && !this._autoAck && UNITY_ACKS[eventType] && eventType !== ACK) {
+      this._unityAcks[eventType] = id;
+      parked = true;
+    }
     this._dispatch(eventType, payload);
-    if (typeof data.id === "string") this._maybeAck(data.id, eventType);
+    if (id && !parked) this._maybeAck(id, eventType);
   };
 
   GameHubSDK.prototype._dispatch = function (type, payload) {
