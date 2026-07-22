@@ -59,7 +59,7 @@ export const Platform = (() => {
   });
 
   // ---- audio ---------------------------------------------------------------
-  // Two-way, and both directions matter. The platform's volume button sends set_mute and the
+  // Two-way, and both directions matter. The platform's volume button sends gamehub:audio:set and the
   // game MUST honour it, or the button is a lie. When the game mutes itself it says so, and
   // the platform's icon follows. The SDK drops no-op updates, so this cannot ping-pong.
   sdk?.onMute?.(({ muted, source }) => {
@@ -75,7 +75,7 @@ export const Platform = (() => {
   //
   // The platform also treats this subscription as the proof that you handle fullscreen at
   // all, and refuses to publish a game that never registers it.
-  sdk?.on?.("set_fullscreen", ({ fullscreen }) => {
+  sdk?.on?.("gamehub:screen:set", ({ fullscreen }) => {
     state.fullscreen = !!fullscreen;
     log(`fullscreen ${fullscreen ? "entered" : "exited"}`, "in");
     // A canvas game would resize its renderer here.

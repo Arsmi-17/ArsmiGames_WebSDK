@@ -114,10 +114,27 @@ $("btnPlatformLog").addEventListener("click", () => {
 quiz.setMode(SaveTarget.PlatformMirror);
 refreshChips();
 
+/** What the platform published this game as, expressed as the demo's own selector. */
+function targetForSaveMode(saveMode) {
+  if (saveMode === "sdk") return SaveTarget.PlatformMirror;
+  if (saveMode === "backend") return SaveTarget.OwnBackend;
+  return SaveTarget.LocalOnly;
+}
+
 void Platform.connect().then(() => {
   // Declare the manifest and the board once, after the handshake. Doing it before means
   // shouting into a void — there is nobody on the other end of the bridge yet.
   Platform.defineLeaderboard();
+
+  // Follow the mode the PLATFORM reports, rather than staying on the optimistic guess made
+  // above before there was anyone to ask.
+  //
+  // The guess is why this demo showed "Platform — progress is mirrored to the player's
+  // account" while running against a platform that had published it as own-backend and was
+  // storing nothing. Every word on screen was wrong, and the demo is the thing developers
+  // read to learn how the SDK behaves, so it was teaching the wrong lesson confidently.
+  quiz.setMode(targetForSaveMode(Platform.state.saveMode));
+
   quiz.load();
   refreshChips();
 });

@@ -90,8 +90,8 @@ counts as a pass.
 | Function | Publish? | Platform → game (you must) | Game → platform (you may) |
 |---|---|---|---|
 | **Handshake** | **Required** | `bridge:init` → the SDK auto-replies `bridge:ready` and reports capabilities. Just load the SDK. | — |
-| **Mute** | **Required** | `set_mute` → zero **all** audio channels. Ack is automatic once you call `onMute`. | `setMuted(true)` when your own sliders all reach 0; `false` when any rises. Skip if you have no volume UI. |
-| **Fullscreen** | **Required** | `set_fullscreen` → ack by subscribing `on("set_fullscreen", …)`; re-fit a fixed canvas. | `requestPlatformFullscreen()` — **only** if your game already has a fullscreen button. Do not add one. |
+| **Mute** | **Required** | `gamehub:audio:set` → zero **all** audio channels. Ack is automatic once you call `onMute`. | `setMuted(true)` when your own sliders all reach 0; `false` when any rises. Skip if you have no volume UI. |
+| **Fullscreen** | **Required** | `gamehub:screen:set` → ack by subscribing `on("gamehub:screen:set", …)`; re-fit a fixed canvas. | `requestPlatformFullscreen()` — **only** if your game already has a fullscreen button. Do not add one. |
 | **Identity** | Required for **own-backend** save | `user.onChange(({ playerId }) => …)` → key your saves on `playerId`. | `user.get()` to ask for it. |
 | **Save (Platform)** | Required if published **Platform save** | `data.onChange` → re-read the save, do not keep stale values. | `data.setItem/getItem/clear`. **Never store currency in a save** — it is on the player's machine and editable. |
 | **Wallet (Flux)** | Only if you sell for Flux | `wallet.onChange(balance => …)` → update your HUD. | `wallet.get()` to read; `wallet.spend(n, reason)` to spend, and wait for `ok` before granting. **A game cannot earn Flux** — `wallet.set/add/earn` are refused before they leave the iframe. |
@@ -313,7 +313,7 @@ function onVolumeChanged() {
 
 You do not need to guard against spamming this — the SDK drops no-op updates, so calling
 `setMuted(false)` twice, or on every slider tick, sends nothing the second time and cannot
-ping-pong against the platform's own `set_mute`.
+ping-pong against the platform's own `gamehub:audio:set`.
 
 If your game has **no** volume controls, you can skip this direction entirely. Honouring
 `onMute` is the only part that is mandatory.
@@ -324,7 +324,7 @@ If your game has **no** volume controls, you can skip this direction entirely. H
 resizes the frame around your game. All you have to do is *acknowledge* that you heard it:
 
 ```js
-sdk.on("set_fullscreen", ({ fullscreen }) => {
+sdk.on("gamehub:screen:set", ({ fullscreen }) => {
   // Acknowledged just by subscribing. Nothing else is required.
 });
 ```
@@ -336,7 +336,7 @@ If your game renders to a fixed-size canvas and needs to re-fit when the frame c
 this is where you do it:
 
 ```js
-sdk.on("set_fullscreen", ({ fullscreen }) => {
+sdk.on("gamehub:screen:set", ({ fullscreen }) => {
   resizeCanvasToWindow();   // only if your layout is not already CSS-fluid
 });
 ```
@@ -354,10 +354,10 @@ yourself fights its chrome:
 myFullscreenButton.onclick = () => sdk.requestPlatformFullscreen();
 ```
 
-The platform enters fullscreen and then sends you a `set_fullscreen` back — so the same
+The platform enters fullscreen and then sends you a `gamehub:screen:set` back — so the same
 handler above runs, and your button and the platform's button behave identically. **If your
 game has no fullscreen button, do not add one for this** — the platform already provides one.
-Acknowledging `set_fullscreen` is all that is required.
+Acknowledging `gamehub:screen:set` is all that is required.
 
 ## Preview mode
 
@@ -382,7 +382,7 @@ key that never moves.
 - [ ] The SDK loads, with the local fallback copy shipped next to `index.html`.
 - [ ] The game runs with no platform at all, and does not block on one.
 - [ ] `onMute` silences **every** audio channel, not just some; `setMuted` is sent when the game's own sliders all reach zero.
-- [ ] `set_fullscreen` is subscribed to (acknowledged), even if the body is empty.
+- [ ] `gamehub:screen:set` is subscribed to (acknowledged), even if the body is empty.
 - [ ] `data.onChange` re-reads the save rather than keeping the old values.
 - [ ] Rewarded ads grant **only** on `rewarded: true`, and the skip path is tested.
 - [ ] Wallet uses `spend()`, and grants nothing until it resolves `ok`.
