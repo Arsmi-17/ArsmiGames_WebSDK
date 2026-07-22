@@ -8,7 +8,7 @@
   var ACK = "gamehub:ack";
 
   /**
-   * This SDK's version. Kept identical to apps/gamehub-sdk/package.json by sdk:check, which
+   * This SDK's version. Kept identical to packages/sdk/protocol/manifest.mjs by sdk:check, which
    * fails the build if the two disagree.
    *
    * It has to mean something, and until 1.0.0 it did not: every SDK ever shipped reported
@@ -20,7 +20,7 @@
    * version from here is compared against the platform's own at handshake. Bump it whenever
    * the wire protocol changes.
    */
-  var SDK_VERSION = "1.0.1";
+  var SDK_VERSION = "2.0.0";
 
   // ---- Acknowledgements ----------------------------------------------------
   //
@@ -28,7 +28,7 @@
   // one question neither side can otherwise ask: did you actually do anything with that?
   //
   // Delivery is not the interesting part — postMessage does not lose messages. `handled` is.
-  // The platform can watch what a game SENDS, but a game *receiving* set_mute and honouring
+  // The platform can watch what a game SENDS, but a game *receiving* gamehub:audio:set and honouring
   // it produces no traffic at all, so from outside, a game that mutes itself and a game that
   // ignores the volume button look identical. The ack is the game's own code path answering
   // for itself.
@@ -37,12 +37,12 @@
    * Which subscriptions count as handling a given inbound message.
    *
    * A game handles mute by calling onMute(), which subscribes to gamehub:audio:muted — NOT to
-   * set_mute, which the SDK itself consumes. Counting handlers on set_mute alone would report
+   * gamehub:audio:set, which the SDK itself consumes. Counting handlers on gamehub:audio:set alone would report
    * "unhandled" for a game that handles mute perfectly.
    */
   var ACK_PROOF = {
-    "set_mute": ["set_mute", "gamehub:audio:muted"],
-    "set_fullscreen": ["set_fullscreen"],
+    "gamehub:audio:set": ["gamehub:audio:set", "gamehub:audio:muted"],
+    "gamehub:screen:set": ["gamehub:screen:set"],
     "gamehub:data:state": ["gamehub:data:state", "gamehub:data:changed"],
     "gamehub:user:state": ["gamehub:user:state"],
     "gamehub:wallet:state": ["gamehub:wallet:state", "gamehub:wallet:changed"],
@@ -58,7 +58,7 @@
    * platform's volume button entirely. GameHubBridge.cs looks at its own event subscriptions
    * and answers honestly through ackEvent().
    */
-  var UNITY_ACKS = { "set_mute": true, "set_fullscreen": true };
+  var UNITY_ACKS = { "gamehub:audio:set": true, "gamehub:screen:set": true };
 
   /**
    * Events a game is not allowed to send, ever.
@@ -144,11 +144,11 @@
     //
     // This is different: each flag is set only when the game really registers a handler
     // or calls the API. It is what the platform checks before letting a game be
-    // published, because "the platform sent set_mute" and "the game muted itself" are
+    // published, because "the platform sent gamehub:audio:set" and "the game muted itself" are
     // not the same fact, and only the second one matters to a player.
     this._wired = {
-      mute: false,        // subscribed to set_mute (the platform's volume button)
-      fullscreen: false,  // subscribed to set_fullscreen, or asks for it
+      mute: false,        // subscribed to gamehub:audio:set (the platform's volume button)
+      fullscreen: false,  // subscribed to gamehub:screen:set, or asks for it
       data: false,        // uses the save API at all
       user: false,        // reads who the player is (needed for own-backend saves)
       wallet: false,
@@ -226,19 +226,19 @@
       },
       setItem: function (key, value) {
         self._wire("data");
-        if (!self._requireSaveMode()) return;
+        if (!self._requireSaveMode() || !self._requireLoaded("setItem")) return;
         self._save.cache[String(key)] = String(value);
         self._scheduleFlush();
       },
       removeItem: function (key) {
-        if (!self._requireSaveMode()) return;
+        if (!self._requireSaveMode() || !self._requireLoaded("removeItem")) return;
         delete self._save.cache[String(key)];
         self._scheduleFlush();
       },
       keys: function () { return Object.keys(self._save.cache); },
       getAll: function () { return Object.assign({}, self._save.cache); },
       clear: function () {
-        if (!self._requireSaveMode()) return;
+        if (!self._requireSaveMode() || !self._requireLoaded("clear")) return;
         self._save.cache = {};
         self.emit("gamehub:data:clear", {});
       },
@@ -391,11 +391,11 @@
     };
 
     // ---- Mute ------------------------------------------------------------
-    // Two directions, and both matter. The platform's volume button sends set_mute;
+    // Two directions, and both matter. The platform's volume button sends gamehub:audio:set;
     // the game must honour it or the button is a lie. When the game mutes itself, it
-    // sends audio_muted so the platform's icon matches what the player hears.
+    // sends gamehub:audio:changed so the platform's icon matches what the player hears.
     this._muted = false;
-    this._onInternal("set_mute", function (payload) {
+    this._onInternal("gamehub:audio:set", function (payload) {
       var next = !!(payload && payload.muted);
       if (next === self._muted) return;
       self._muted = next;
@@ -502,6 +502,29 @@
       // Ask, in case the unprompted push at bridge init already went by.
       self.emit("gamehub:data:get", {});
     });
+  };
+
+  /**
+   * Rule 2 of the save contract: nothing is written before the player's save arrives.
+   *
+   * Until it does, the game does not know whether this player is new — and on a browser they
+   * have never used, everything local reads as "new". A write made in that window is this
+   * browser's blank state, and it lands on top of the account save still in flight. That is not
+   * a hypothetical: it is how a real player's progress was replaced by zeroes.
+   *
+   * Dropped and named, rather than queued. Queuing would preserve values the game computed from
+   * a state it should never have acted on, which is the same bug with a delay.
+   */
+  GameHubSDK.prototype._requireLoaded = function (call) {
+    if (this._save.loaded) return true;
+    if (console && console.warn) {
+      console.warn(
+        "[GameHubSDK] data." + call + "() was called before the player's save arrived, so it was " +
+        "dropped. Wait for init() to resolve (or data.isReady()) before writing — until then a " +
+        "brand-new browser and a brand-new player look identical."
+      );
+    }
+    return false;
   };
 
   GameHubSDK.prototype._requireSaveMode = function () {
@@ -759,8 +782,8 @@
 
   /** Which requirement a given subscription satisfies. */
   var WIRES = {
-    "set_mute": "mute",
-    "set_fullscreen": "fullscreen",
+    "gamehub:audio:set": "mute",
+    "gamehub:screen:set": "fullscreen",
     "gamehub:data:changed": "data",
     "gamehub:user:state": "user",
     "gamehub:wallet:changed": "wallet",
@@ -776,7 +799,7 @@
   /**
    * Unity reports its own wiring, from C#.
    *
-   * The .jslib subscribes to set_mute, set_fullscreen and the rest on the game's behalf,
+   * The .jslib subscribes to gamehub:audio:set, gamehub:screen:set and the rest on the game's behalf,
    * whether or not the game's C# does anything with them. So inferring wiring from JS
    * handlers in a Unity build would mark every Unity game as compliant — including one
    * that ignores the platform's volume button entirely. GameHubBridge.cs looks at its own
@@ -868,18 +891,18 @@
 
   GameHubSDK.prototype.requestPlatformFullscreen = function (orientation) {
     this._wire("fullscreen");
-    this.emit("fullscreen_request", { orientation: orientation || "auto" });
+    this.emit("gamehub:screen:request", { orientation: orientation || "auto" });
   };
 
   /** Tells the platform the game muted/unmuted itself, so its volume icon matches. */
   GameHubSDK.prototype.setMuted = function (muted) {
     this._wire("mute");
     var next = !!muted;
-    // The platform echoes its own set_mute back to us. Without this guard that echo
-    // would bounce straight back out as audio_muted and the two would ping-pong.
+    // The platform echoes its own gamehub:audio:set back to us. Without this guard that echo
+    // would bounce straight back out as gamehub:audio:changed and the two would ping-pong.
     if (next === this._muted) return;
     this._muted = next;
-    this.emit("audio_muted", { muted: next });
+    this.emit("gamehub:audio:changed", { muted: next });
     this._dispatch("gamehub:audio:muted", { muted: next, source: "game" });
   };
 
@@ -976,9 +999,9 @@
     var eventType = data.type === BRIDGE_EVENT && typeof data.event === "string" ? data.event : data.type;
     var payload = data.type === BRIDGE_EVENT && isObject(data.payload) ? data.payload : data;
 
-    // Reset before the top-level dispatch, not inside it: handling set_mute runs a nested
+    // Reset before the top-level dispatch, not inside it: handling gamehub:audio:set runs a nested
     // dispatch of gamehub:audio:muted, and a throw in the game's mute handler happens down
-    // there. It still has to count against the ack for set_mute.
+    // there. It still has to count against the ack for gamehub:audio:set.
     this._dispatchErrors = 0;
 
     // Unity's ack id is parked BEFORE the dispatch, and only Unity's.
