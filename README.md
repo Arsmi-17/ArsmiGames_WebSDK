@@ -76,6 +76,21 @@ not hang — which is exactly what would happen if you awaited a message that ne
 Declare your leaderboard **after** the handshake. Before it, you are
 shouting into a void: there is nobody on the other end of the bridge yet.
 
+To know *whether* there is anyone on the other end at all:
+
+```js
+GameHubBridge.onConnection((c) => {
+  if (c.connected) startOnlineRun(c.gameId);
+  else             startOfflineRun();   // c.reason === "standalone"
+});
+```
+
+It fires once there is an **answer**, which is not the same as firing immediately — before the
+handshake lands the honest answer is "not yet", and `getConnection().known` is how you tell that
+apart from a real no. If nothing answers within a second and a half you get `connected: false`
+rather than silence. Do not use `window.parent` for this: it is equally true inside anyone
+else's iframe.
+
 ## The contract, function by function
 
 Every function is one or both of two directions: the **platform sends** your game something and
@@ -90,6 +105,7 @@ counts as a pass.
 | Function | Publish? | Platform → game (you must) | Game → platform (you may) |
 |---|---|---|---|
 | **Handshake** | **Required** | `bridge:init` → the SDK auto-replies `bridge:ready` and reports capabilities. Just load the SDK. | — |
+| **Connection** | Optional | `onConnection(c => …)` → fires once there is an answer: `c.connected` true on the platform, false with `c.reason === "standalone"` when nothing answered. | Nothing to send. `isConnected()`, `getConnection()` and `await whenConnected()` read the same answer. |
 | **Mute** | **Required** | `gamehub:audio:set` → zero **all** audio channels. Ack is automatic once you call `onMute`. | `setMuted(true)` when your own sliders all reach 0; `false` when any rises. Skip if you have no volume UI. |
 | **Fullscreen** | **Required** | `gamehub:screen:set` → ack by subscribing `on("gamehub:screen:set", …)`; re-fit a fixed canvas. | `requestPlatformFullscreen()` — **only** if your game already has a fullscreen button. Do not add one. |
 | **Identity** | Required for **own-backend** save | `user.onChange(({ playerId }) => …)` → key your saves on `playerId`. | `user.get()` to ask for it. |

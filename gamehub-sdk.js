@@ -6,6 +6,18 @@
   var BRIDGE_EVENT = "gamehub:bridge:event";
   var BRIDGE_LOG = "gamehub:bridge:log";
   var ACK = "gamehub:ack";
+  var CONNECTION = "gamehub:connection:state";
+
+  /**
+   * How long to wait for gamehub:bridge:init before telling the game it is standalone.
+   *
+   * The host posts init from the iframe's load handler, so in production it lands within a
+   * few milliseconds of this file running. The wait is long enough that a busy main thread —
+   * a Unity build decompressing its wasm is the worst case — cannot make a connected game
+   * look standalone, and short enough that a game opened from disk is not left staring at a
+   * spinner. It is a deadline, not a verdict: a host that answers afterwards still connects.
+   */
+  var STANDALONE_AFTER_MS = 1500;
 
   /**
    * This SDK's version. Kept identical to packages/sdk/protocol/manifest.mjs by sdk:check, which
@@ -20,7 +32,15 @@
    * version from here is compared against the platform's own at handshake. Bump it whenever
    * the wire protocol changes.
    */
-  var SDK_VERSION = "2.0.0";
+  var SDK_VERSION = "2.2.0";
+
+  /**
+   * The wire protocol this SDK speaks, and the only number that answers whether a game and
+   * the platform can actually talk. SDK_VERSION cannot: the web package is on 2.x and the
+   * Unity package on 4.x for UPM reasons, so two games on the same protocol report different
+   * versions. Pinned to manifest.mjs by sdk:check, like SDK_VERSION above.
+   */
+  var PROTOCOL = 2;
 
   // ---- Acknowledgements ----------------------------------------------------
   //
@@ -106,6 +126,106 @@
     return false;
   }
 
+  var DEVICE_TYPES = { mobile: true, tablet: true, desktop: true };
+
+  /**
+   * A rough device guess, for when there is no platform to ask.
+   *
+   * This is NOT the platform's detector, and it deliberately is not as good. The real one is
+   * packages/sdk/tools/deviceProfile.ts, which the host runs and sends down at handshake — it
+   * handles cases this cannot, most importantly an iPad reporting itself as a Mac.
+   *
+   * This one exists so that a game opened from disk, or run under the local test harness, gets
+   * a usable answer instead of null — because a game handed null will go and sniff the user
+   * agent itself, which is the whole problem this feature removes.
+   *
+   * It can never contradict the platform: it only runs when there is no platform, and anything
+   * it produces is labelled source:"local". Do not make the host call this.
+   */
+  /**
+   * Which way the frame is: "portrait" or "landscape".
+   *
+   * A guess, made from whatever the environment answers, and replaced by the platform's own at
+   * handshake. It exists for the same reason guessDevice() does: a game asking which way it is
+   * being held and getting undefined has to write a guard, and every game would write the same
+   * one. A frame with no measurable size is called landscape, which is what a desktop browser
+   * and a headless context both are.
+   */
+  function guessOrientation() {
+    try {
+      if (typeof window === "undefined") return "landscape";
+      if (typeof window.matchMedia === "function") {
+        var mq = window.matchMedia("(orientation: portrait)");
+        if (mq && typeof mq.matches === "boolean") return mq.matches ? "portrait" : "landscape";
+      }
+      var w = Number(window.innerWidth) || 0;
+      var h = Number(window.innerHeight) || 0;
+      if (w && h) return h > w ? "portrait" : "landscape";
+    } catch (_e) { /* a context that answers nothing is a landscape one */ }
+    return "landscape";
+  }
+
+  function readOrientation(value) {
+    return value === "portrait" || value === "landscape" ? value : null;
+  }
+
+  function guessDevice() {
+    var nav = typeof navigator !== "undefined" ? navigator : null;
+    var ua = nav && nav.userAgent ? String(nav.userAgent) : "";
+    var touchPoints = nav && nav.maxTouchPoints ? Number(nav.maxTouchPoints) : 0;
+    var mq = function (query) {
+      try {
+        return typeof window !== "undefined" && typeof window.matchMedia === "function"
+          ? !!window.matchMedia(query).matches
+          : false;
+      } catch (_e) { return false; }
+    };
+    var coarse = mq("(any-pointer: coarse)");
+    var fine = mq("(any-pointer: fine)");
+    var touch = touchPoints > 0 || coarse;
+    var shortSide = 1080;
+    if (typeof window !== "undefined" && window.innerWidth) {
+      shortSide = Math.min(window.innerWidth, window.innerHeight || window.innerWidth);
+    }
+
+    // "Macintosh" only. Every iOS user agent contains "like Mac OS X", so matching that phrase
+    // would make an iPhone look like a touchscreen Mac — which is to say, an iPad.
+    var type = "desktop";
+    if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && touchPoints > 1)) type = "tablet";
+    else if (/Android/i.test(ua)) type = /Mobile/i.test(ua) ? "mobile" : "tablet";
+    else if (/iPhone|iPod/i.test(ua)) type = "mobile";
+    else if (touch && !fine) type = shortSide >= 768 ? "tablet" : "mobile";
+
+    return {
+      type: type,
+      input: {
+        touch: touch,
+        keyboard: type === "desktop" || (touch && fine),
+        mouse: fine || (!touch && type === "desktop"),
+        gamepad: false,
+      },
+      source: "local",
+    };
+  }
+
+  /** The host's device object, validated. Returns null when there is nothing usable in it. */
+  function readHostDevice(raw) {
+    if (!isObject(raw)) return null;
+    var type = String(raw.type || "");
+    if (!DEVICE_TYPES[type]) return null;
+    var input = isObject(raw.input) ? raw.input : {};
+    return {
+      type: type,
+      input: {
+        touch: !!input.touch,
+        keyboard: !!input.keyboard,
+        mouse: !!input.mouse,
+        gamepad: !!input.gamepad,
+      },
+      source: "platform",
+    };
+  }
+
   function GameHubSDK(options) {
     options = options || {};
     this.sessionId = null;
@@ -123,7 +243,10 @@
     // and only the game's count as evidence that the game handles something.
     this._internalCounts = {};
     this.destroyed = false;
-    this.context = { preview: false };
+    // Guessed now so it is never null, and overwritten by the platform's better answer at
+    // handshake. See guessDevice() for why the two are allowed to be different code.
+    this.context = { preview: false, device: guessDevice(), orientation: guessOrientation() };
+    this._declaredDevices = [];
 
     // Acks. `_outSeq` numbers what we send; `_unityAcks` parks the id of a message we have
     // handed to C# and are waiting for it to answer for.
@@ -136,6 +259,21 @@
     // itself too old to say — an unknown platform version is not evidence of anything.
     this._platformVersion = null;
     this._stale = false;
+
+    // ---- am I on the platform? ---------------------------------------------
+    //
+    // `known` is the field that matters, and it is why this is not just a boolean. Before the
+    // handshake the honest answer is "not yet", not "no" — a game that treated false as no
+    // would flash its offline screen on every single page load, in the milliseconds before
+    // init arrives. Nothing here is reported until one of the two answers is real.
+    this._connection = { connected: false, known: false };
+    this._connectionResolvers = [];
+    var deadline = this;
+    this._connectionTimer = setTimeout(function () {
+      deadline._connectionTimer = null;
+      if (deadline.destroyed || deadline._connection.known) return;
+      deadline._setConnection({ connected: false, known: true, reason: "standalone" });
+    }, STANDALONE_AFTER_MS);
 
     // ---- what the game ACTUALLY wired up -----------------------------------
     //
@@ -154,12 +292,16 @@
       wallet: false,
       ads: false,
       leaderboard: false,
+      pocket: false,      // subscribed to gamehub:pocket:input (a phone as controller)
     };
     // Unity reports its own wiring from C# — the .jslib subscribes to everything on the
     // game's behalf, so inferring from JS handlers there would mark every Unity game as
     // compliant regardless of what its C# does. See setWiring() and UNITY_ACKS.
     this._autoWiring = options.engine !== "unity";
     this._autoAck = options.engine !== "unity";
+    // Older Unity builds construct with { engine: "unity" } instead of calling setEngine, so
+    // the save has to be requested down this path too. See _askForSave.
+    if (options.engine === "unity") this._askForSave();
 
     this._onMessage = this._onMessage.bind(this);
     window.addEventListener("message", this._onMessage);
@@ -167,6 +309,13 @@
     var self = this;
 
     this._onInternal("gamehub:capabilities:get", function () { self._reportCapabilities(); });
+    // A rotation reaches the game as gamehub:screen:set — the platform resizing the frame,
+    // which is exactly what turning a phone does. Registered here rather than in the message
+    // handler so it runs BEFORE the game's own subscription: a game reading getOrientation()
+    // from inside its screen:set handler must see the orientation it is being told about, not
+    // the one from before. Internal, so it does not answer the fullscreen wiring check for a
+    // game that never subscribed itself.
+    this._onInternal("gamehub:screen:set", function (payload) { self._onScreenSet(payload); });
     this._onInternal(ACK, function (payload) { self._onHostAck(payload); });
     this.challenge = {
       ready: function (payload) { self.emit("gamehub:challenge:ready", payload || {}); },
@@ -183,6 +332,39 @@
       onPlayerJoined: function (handler) { return self.on("gamehub:pocket:player_joined", handler); },
       onPlayerReconnected: function (handler) { return self.on("gamehub:pocket:player_reconnected", handler); },
       onPlayerLeft: function (handler) { return self.on("gamehub:pocket:player_left", handler); },
+
+      /**
+       * Move every phone to a screen the controller declared.
+       *
+       * `data` is yours and opaque to every hop between here and the phone — nothing inspects a
+       * key, supplies a default, or attaches meaning to a field name. It reaches the controller
+       * as the `detail.data` of a `pocket:screen` event.
+       *
+       * Deliberately NOT wired via _wire(): `pocket` means "this game handles phone input", and
+       * pushing a screen is not handling input. Two bits for one capability is how a game gets
+       * reported as supporting Pocket Console when it reads nothing.
+       */
+      setState: function (screen, data) {
+        self.emit("gamehub:pocket:state", { slot: null, screen: String(screen == null ? "" : screen), data: data || {} });
+      },
+
+      /**
+       * Move ONE seat. This is the whole of multiplayer state: a game where the first finisher
+       * ends it for everyone calls setState; a game where the others keep playing calls this for
+       * the seat that finished. A race needs both — seat-targeted as players cross the line, then
+       * setState("ranking") once all are done — which is why there is no mode to declare.
+       *
+       * A bad slot is logged rather than thrown: a game must not crash because it computed a seat
+       * wrong, and a silent drop would be worse than either.
+       */
+      setSeatState: function (slot, screen, data) {
+        var seat = Math.trunc(Number(slot));
+        if (!isFinite(seat) || seat < 1) {
+          self.log("warn", "pocket.setSeatState ignored: slot must be a whole number of 1 or more", { slot: slot, screen: screen });
+          return;
+        }
+        self.emit("gamehub:pocket:state", { slot: seat, screen: String(screen == null ? "" : screen), data: data || {} });
+      },
     };
     this.leaderboard = {
       // Declaring a board or posting a score IS using the leaderboard, so both mark it wired.
@@ -193,6 +375,49 @@
       define: function (payload) { self._wire("leaderboard"); self.emit("gamehub:leaderboard:define", payload || {}); },
       submitScore: function (payload) { self._wire("leaderboard"); self.emit("gamehub:leaderboard:score", payload || {}); },
       onSharing: function (handler) { return self.on("gamehub:leaderboard:sharing", handler); },
+    };
+
+    // ---- Device ----------------------------------------------------------
+    //
+    // Entirely optional. A game that ignores this behaves exactly as it always did, and a game
+    // that declares nothing supports every device — silence means everywhere, everywhere.
+    this.device = {
+      /** What we are running on: { type, input, source }. Never null. */
+      get: function () {
+        var current = self.context.device || guessDevice();
+        return {
+          type: current.type,
+          input: {
+            touch: !!current.input.touch,
+            keyboard: !!current.input.keyboard,
+            mouse: !!current.input.mouse,
+            gamepad: !!current.input.gamepad,
+          },
+          source: current.source,
+        };
+      },
+
+      /**
+       * Declare the devices this game is built for, e.g. ["desktop"].
+       *
+       * This only ever RESTRICTS your own game, which is why the platform accepts it as a claim
+       * rather than demanding proof. The platform shows a note to players on other devices; it
+       * does not stop them. Declaring nothing, or an empty array, means every device.
+       */
+      supports: function (types) {
+        var list = [];
+        var input = Array.isArray(types) ? types : [];
+        for (var i = 0; i < input.length; i++) {
+          var name = String(input[i] || "");
+          if (DEVICE_TYPES[name] && list.indexOf(name) < 0) list.push(name);
+        }
+        self._declaredDevices = list;
+        // Push it rather than wait to be asked: a game may declare long after the host's probe.
+        self._reportCapabilities();
+      },
+
+      /** What this game declared, as an array. Empty means every device. */
+      declared: function () { return self._declaredDevices.slice(); },
     };
 
     // ---- Save data -------------------------------------------------------
@@ -496,11 +721,26 @@
   GameHubSDK.prototype.init = function () {
     var self = this;
     this._wire("data");
+
+    // ASK, ALWAYS — even when the save is already here.
+    //
+    // The host pushes gamehub:data:state unprompted at the handshake, and a game cannot call
+    // init() before the bridge exists, so the save has usually ALREADY arrived by the time
+    // init() runs. This used to return early in that case without sending anything.
+    //
+    // Which meant the platform never saw the game touch the save API. Its publish gate looks
+    // for a data:get, :set or :clear, so a game that called init() correctly and then simply
+    // had not written yet — a quiz nobody had answered, a level nobody had finished — was
+    // refused with "published as Platform save, but it never used the save API". The failure
+    // depended on message ordering, so it looked intermittent and survived being "tested" by a
+    // test that happened to call init() first.
+    //
+    // The extra ask costs one message and the host answers it with the state it already sent.
+    self.emit("gamehub:data:get", {});
+
     if (this._save.loaded) return Promise.resolve(this.data.getAll());
     return new Promise(function (resolve) {
       self._save.readyResolvers.push(resolve);
-      // Ask, in case the unprompted push at bridge init already went by.
-      self.emit("gamehub:data:get", {});
     });
   };
 
@@ -698,6 +938,16 @@
   GameHubSDK.prototype.destroy = function () {
     this.destroyed = true;
     this.handlers = {};
+    if (this._connectionTimer) {
+      clearTimeout(this._connectionTimer);
+      this._connectionTimer = null;
+    }
+    // Resolve rather than drop them. A promise nobody will ever settle is the exact failure
+    // this signal exists to prevent, and tearing the bridge down is the one place it could
+    // come back: a game awaiting whenConnected() through a teardown would simply stop.
+    var abandoned = this._connectionResolvers;
+    this._connectionResolvers = [];
+    for (var i = 0; i < abandoned.length; i++) abandoned[i](false);
     window.removeEventListener("message", this._onMessage);
   };
 
@@ -790,6 +1040,7 @@
     "gamehub:ad:finished": "ads",
     "gamehub:leaderboard:sharing": "leaderboard",
     "gamehub:audio:muted": "mute",
+    "gamehub:pocket:input": "pocket",
   };
 
   GameHubSDK.prototype._wire = function (name) {
@@ -841,7 +1092,33 @@
       // Anything already inferred came from JS subscriptions, and in Unity those are not the
       // game's. C# is about to report the truth; start it from nothing.
       for (var key in this._wired) this._wired[key] = false;
+      this._askForSave();
     }
+  };
+
+  /**
+   * Requests the player's save on a Unity game's behalf.
+   *
+   * A web game asks in init(). Unity has no equivalent — nothing in the C# or the .jslib ever
+   * asked — so the save arrived only if the host volunteered it, and the platform never saw the
+   * game touch the save API at all. Every Unity game published as "Platform save" was refused
+   * with "it never used the save API".
+   *
+   * It lives HERE, in the SDK, rather than in the .jslib on purpose. The .jslib is compiled
+   * into a WebGL build and cannot change without a rebuild, but gamehub-sdk.js is loaded from
+   * the platform's own origin at run time — so putting it here fixes games that were already
+   * built, including ones nobody can rebuild any more.
+   *
+   * _wire() is a no-op in Unity mode, so this asks for the save without claiming the game uses
+   * it. What the game implements is still reported by C#, from its own subscriptions.
+   */
+  GameHubSDK.prototype._askForSave = function () {
+    var self = this;
+    // After the handshake, so the host knows who is asking. Deferred rather than queued: the
+    // engine is set during bridge init, which is the same turn the host is still setting up.
+    setTimeout(function () {
+      if (!self.destroyed) self.emit("gamehub:data:get", {});
+    }, 0);
   };
 
   GameHubSDK.prototype._reportCapabilities = function () {
@@ -856,6 +1133,13 @@
       declared: Object.assign({}, this.capabilities),
       // What the game actually wired up. Gate on this.
       wired: this.getWiring(),
+      // Which devices the game says it is built for. Empty means every device.
+      //
+      // This is a CLAIM, in a payload that otherwise carries only proof — "anything that must
+      // not be trusted should not be transmitted". It is admissible because it only ever
+      // restricts the game that sends it: there is nothing a game can claim its way INTO here.
+      // The platform shows players a note; it grants nothing.
+      devices: this._declaredDevices.slice(),
       saveMode: this._save.mode,
     });
   };
@@ -931,9 +1215,126 @@
     return !!(this.context && this.context.preview);
   };
 
+  /**
+   * Whether this game is talking to a platform. False until the handshake lands, and false
+   * for ever in a page that is not the platform — use getConnection().known to tell the two
+   * apart, or onConnection(), which does not fire until there is a real answer.
+   */
+  GameHubSDK.prototype.isConnected = function () {
+    return this._connection.connected === true;
+  };
+
+  /**
+   * The whole answer: { connected, known, reason?, sessionId, gameId, slug, role, preview,
+   * platformVersion, sdkVersion, protocol }. A copy, so a game cannot edit the SDK's own state.
+   */
+  GameHubSDK.prototype.getConnection = function () {
+    return Object.assign({}, this._connection);
+  };
+
+  /**
+   * Called once there IS an answer, and again if it changes — immediately if the answer is
+   * already in, which is the case for anything subscribing from C# after a Unity boot.
+   *
+   * Deliberately unlike onContext, which fires immediately no matter what: here, "not yet"
+   * and "no" must never look the same to a game.
+   *
+   * Returns an unsubscribe function.
+   */
+  GameHubSDK.prototype.onConnection = function (handler) {
+    var unsubscribe = this.on(CONNECTION, handler);
+    if (this._connection.known) handler(this.getConnection());
+    return unsubscribe;
+  };
+
+  /** The same answer as a promise, for boot code that would rather await than subscribe. */
+  GameHubSDK.prototype.whenConnected = function () {
+    var self = this;
+    if (this._connection.known) return Promise.resolve(this._connection.connected === true);
+    return new Promise(function (resolve) { self._connectionResolvers.push(resolve); });
+  };
+
+  /**
+   * Record an answer and tell whoever asked. Silent when nothing actually changed, so a host
+   * that re-sends init — the player page does, on a soft navigation — does not fire the
+   * signal twice for one connection.
+   */
+  GameHubSDK.prototype._setConnection = function (next) {
+    var was = this._connection;
+    var same = was.known === next.known &&
+      was.connected === next.connected &&
+      was.sessionId === next.sessionId &&
+      was.gameId === next.gameId;
+    this._connection = next;
+    if (same) return;
+    this._dispatch(CONNECTION, this.getConnection());
+    var resolvers = this._connectionResolvers;
+    this._connectionResolvers = [];
+    for (var i = 0; i < resolvers.length; i++) resolvers[i](next.connected === true);
+  };
+
   GameHubSDK.prototype.onContext = function (handler) {
     var unsubscribe = this.on("gamehub:context", handler);
     handler(this.getContext());
+    return unsubscribe;
+  };
+
+  /**
+   * Which way the frame is right now: "portrait" or "landscape". Never null.
+   *
+   * On a phone this is how the player is holding it, and it changes when they turn it. It is
+   * NOT the orientation the game was uploaded as — a game already knows how it was built, and
+   * the platform no longer forces the screen to match it.
+   */
+  GameHubSDK.prototype.getOrientation = function () {
+    return this.context.orientation || guessOrientation();
+  };
+
+  /**
+   * Fires with the current orientation, then again each time the frame turns.
+   *
+   * Fires immediately, unlike onConnection: there is always an answer here, because the SDK
+   * guesses one before the handshake rather than leaving a game with undefined.
+   *
+   * Returns an unsubscribe function.
+   */
+  GameHubSDK.prototype.onOrientation = function (handler) {
+    var self = this;
+    var last = this.getOrientation();
+    var unsubscribe = this.on("gamehub:context", function () {
+      var now = self.getOrientation();
+      if (now === last) return;   // a context re-dispatch is not a rotation
+      last = now;
+      handler(now);
+    });
+    handler(last);
+    return unsubscribe;
+  };
+
+  /**
+   * The frame changed. Adopt a new orientation if one came with it.
+   *
+   * Silent when nothing turned: the host sends this on every fullscreen change too, and a game
+   * that re-laid-out for each of those would be re-laying-out for rotations that never
+   * happened. Re-dispatching the context is what carries the news to onContext subscribers —
+   * which includes Unity's .jslib, so a build compiled before any of this existed hears a
+   * rotation without being rebuilt.
+   */
+  GameHubSDK.prototype._onScreenSet = function (payload) {
+    var next = readOrientation(isObject(payload) ? payload.orientation : null);
+    if (!next || next === this.context.orientation) return;
+    this.context.orientation = next;
+    this._dispatch("gamehub:context", this.getContext());
+  };
+
+  /**
+   * Fires with the current device, then again if the platform's answer differs from the guess
+   * the SDK made before the handshake. Payload: { type, input, source }.
+   */
+  GameHubSDK.prototype.onDevice = function (handler) {
+    var self = this;
+    var unsubscribe = this.on("gamehub:context", function () { handler(self.device.get()); });
+    handler(this.device.get());
     return unsubscribe;
   };
 
@@ -949,7 +1350,12 @@
         gameId: typeof data.gameId === "string" ? data.gameId : undefined,
         slug: typeof data.slug === "string" ? data.slug : undefined,
         embedType: typeof data.embedType === "string" ? data.embedType : undefined,
-        orientation: typeof data.orientation === "string" ? data.orientation : undefined,
+        // The frame's orientation, which on a phone is how the player is holding it. A host
+        // too old to send one leaves the local guess standing rather than blanking it.
+        orientation: readOrientation(data.orientation) || this.context.orientation || guessOrientation(),
+        // A host that sends nothing, or nonsense, leaves the local guess standing. A game must
+        // never read device.type and get undefined — that would put a guard in every game.
+        device: readHostDevice(data.device) || this.context.device || guessDevice(),
         testUser: isObject(data.testUser)
           ? {
               id: String(data.testUser.id || "preview-user"),
@@ -975,6 +1381,26 @@
         preview: this.context.preview,
       });
       this._dispatch("gamehub:context", this.getContext());
+
+      // The acknowledgment. After the context dispatch on purpose: a game reading
+      // getContext() from inside its connection handler must see the platform's answer,
+      // not the guess the SDK made before the host spoke.
+      if (this._connectionTimer) {
+        clearTimeout(this._connectionTimer);
+        this._connectionTimer = null;
+      }
+      this._setConnection({
+        connected: true,
+        known: true,
+        sessionId: this.sessionId || undefined,
+        gameId: this.context.gameId,
+        slug: this.context.slug,
+        role: this.context.role,
+        preview: this.context.preview === true,
+        platformVersion: this._platformVersion,
+        sdkVersion: SDK_VERSION,
+        protocol: PROTOCOL,
+      });
       this.log("info", "GameHub SDK ready");
 
       // Said in the game's OWN console, because that is where the developer is looking.
